@@ -40,11 +40,15 @@ function stripHeavy(entry) {
 
 export function createRunRecord({ config, label }) {
   const id = randomUUID().slice(0, 8);
+  const modeTag =
+    config.mode === "ramp"
+      ? `ramp/${Math.round((config.addIntervalMs || 0) / 1000)}s · `
+      : "";
   const entry = {
     id,
     label:
       label ||
-      `${config.maxConcurrency} open · ${Math.round((config.observeMs || 0) / 1000)}s`,
+      `${modeTag}${config.maxConcurrency} open · ${Math.round((config.observeMs || 0) / 1000)}s`,
     status: "queued",
     startedAt: new Date().toISOString(),
     endedAt: null,
@@ -89,7 +93,15 @@ export function setProgress(id, snapshot) {
   if (!entry) return;
   entry.progress = snapshot;
   entry.status = snapshot.phase === "done" ? "running" : "running";
-  if (snapshot.phase === "burst" || snapshot.phase === "ready" || snapshot.phase === "observe") {
+  if (
+    snapshot.phase === "burst" ||
+    snapshot.phase === "ramp" ||
+    snapshot.phase === "ramp_up" ||
+    snapshot.phase === "ramp_down" ||
+    snapshot.phase === "ready" ||
+    snapshot.phase === "observe" ||
+    snapshot.phase === "closing"
+  ) {
     entry.status = "running";
   }
   broadcast(entry, { type: "progress", data: snapshot });

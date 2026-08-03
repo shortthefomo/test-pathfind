@@ -1,8 +1,17 @@
 /**
- * Burst path_find load test:
- *   1. Open all path_find requests as fast as possible (parallel burst)
- *   2. Hold until every successful session is emitting async updates
- *   3. Observe for observeMs (default 2 min) and graph responses over time
+ * path_find load test:
+ *
+ * Burst:
+ *   1. Open all path_finds at once
+ *   2. Wait until sessions emit async updates
+ *   3. Hold for observeMs
+ *   4. Close all at once
+ *
+ * Ramp:
+ *   1. Ramp up: +1 path_find every addIntervalMs until maxConcurrency
+ *   2. Wait until sessions emit async updates
+ *   3. Hold at cap for observeMs
+ *   4. Ramp down: close one path_find every addIntervalMs until none remain
  *
  * Final report includes create latencies, time-series of update gaps, and
  * individual session drill-down.
@@ -106,6 +115,11 @@ export function createLatencyOverTime(timeline) {
  * Async update intervals over wall-clock time.
  * Optionally restrict to events at or after sinceT (run-relative ms).
  */
+/**
+ * Async update→update gaps over wall-clock time.
+ * Skips the first follow-up per session (create → first update): that gap is
+ * not a refresh interval and dwarfs real update cadence under load.
+ */
 export function updateGapOverTime(timeline, { sinceT = 0 } = {}) {
   return timeline
     .filter(
@@ -113,7 +127,9 @@ export function updateGapOverTime(timeline, { sinceT = 0 } = {}) {
         e.type === "follow_up" &&
         e.sincePreviousMs != null &&
         e.t != null &&
-        e.t >= sinceT
+        e.t >= sinceT &&
+        // seq 1 = first async update after create; only plot true refresh gaps
+        (e.seq == null || e.seq > 1)
     )
     .map((e) => ({
       tMs: e.t,
@@ -140,6 +156,8 @@ export function perSessionUpdateGaps(
   for (const e of timeline) {
     if (e.type !== "follow_up" || e.sincePreviousMs == null || e.t == null) continue;
     if (e.t < sinceT) continue;
+    // Skip create → first update; only bucket true path_find refresh gaps
+    if (e.seq != null && e.seq <= 1) continue;
     const id = e.sessionId || "?";
     if (!bySession.has(id)) bySession.set(id, []);
     bySession.get(id).push({ tMs: e.t, ms: e.sincePreviousMs });
@@ -460,23 +478,25 @@ export function buildProgressSnapshot({
   observeStartT = null,
   phases = {},
   message = null,
+  mode = "burst",
+  addIntervalMs = 0,
 }) {
   const open = countOpenWorkers(workers);
   const ready = countReadyWorkers(workers);
   const failed = workers.filter((w) => w.state.failed).length;
   const elapsedMs = Date.now() - runStartedAt;
   const createLatencies = createLatencyOverTime(timeline);
-  const sinceT = observeStartT ?? 0;
+  // Full-run series so UI can shade the observe window against ramp up/down.
   const gapBuckets = bucketTimeSeries(
-    updateGapOverTime(timeline, { sinceT }),
+    updateGapOverTime(timeline, { sinceT: 0 }),
     UPDATE_BUCKET_MS
   ).map((b) => ({ tMs: b.tMs, ms: b.ms, n: b.n }));
   const updateRateBuckets = updateRateOverTime(timeline, {
-    sinceT,
+    sinceT: 0,
     bucketMs: UPDATE_BUCKET_MS,
   }).map((b) => ({ tMs: b.tMs, rate: b.ms, n: b.n }));
   const perSessionGaps = perSessionUpdateGaps(timeline, {
-    sinceT,
+    sinceT: 0,
     bucketMs: UPDATE_BUCKET_MS,
   });
 
@@ -487,10 +507,19 @@ export function buildProgressSnapshot({
     observeRemainMs = Math.max(0, observeMs - observeElapsedMs);
   }
 
+  const observeEndT =
+    observeStartT != null && observeMs != null
+      ? observeStartT + observeMs
+      : null;
+
   return {
     phase,
+    mode,
+    addIntervalMs,
     maxConcurrency,
     observeMs,
+    observeStartT,
+    observeEndT,
     opened: open,
     failed,
     ready,
@@ -532,21 +561,32 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
   const failed = report.failed ?? run.sessions?.filter((s) => s.failed).length ?? 0;
   const maxConcurrency = run.maxConcurrency ?? report.maxConcurrency ?? 0;
 
+  const observeStartT = run.observeStartT ?? report.observeStartT ?? null;
+  const observeMs = run.observeMs ?? report.observeMs ?? null;
+  const observeEndT =
+    observeStartT != null && observeMs != null
+      ? observeStartT + observeMs
+      : null;
+
   return {
     id: id || run.id || null,
     label:
       label ||
       run.label ||
-      `${maxConcurrency} open · ${fmtMs(run.observeMs ?? report.observeMs)}`,
+      `${maxConcurrency} open · ${fmtMs(observeMs)}`,
     status,
     startedAt: run.startedAt,
     endedAt: run.endedAt,
     config: {
       maxConcurrency,
-      observeMs: run.observeMs ?? report.observeMs,
+      mode: run.mode ?? report.mode ?? "burst",
+      addIntervalMs: run.addIntervalMs ?? report.addIntervalMs ?? 0,
+      observeMs,
       readyTimeoutMs: run.readyTimeoutMs ?? report.readyTimeoutMs,
       endpoint: run.endpoint ?? report.endpoint,
     },
+    observeStartT,
+    observeEndT,
     phases: run.phases || report.phases || {},
     stats: {
       opened,
@@ -569,28 +609,39 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
       updateRateMean: rateStats.mean,
     },
     series: {
+      // Full-run series (for observe-window shading on charts). Stats above
+      // still use observe-window-only series from the report.
       createOverTime: (report.createLatencyOverTime || []).map((p) => ({
         tMs: p.tMs,
         ms: p.ms,
         sessionId: p.sessionId,
       })),
-      updateGapBuckets: (report.updateGapBuckets || []).map((p) => ({
-        tMs: p.tMs,
-        ms: p.ms,
-        n: p.n,
-      })),
-      updateRateBuckets: (report.updateRateOverTime || []).map((p) => ({
+      updateGapBuckets: (report.updateGapBucketsFull || report.updateGapBuckets || []).map(
+        (p) => ({
+          tMs: p.tMs,
+          ms: p.ms,
+          n: p.n,
+        })
+      ),
+      updateRateBuckets: (
+        report.updateRateOverTimeFull ||
+        report.updateRateOverTime ||
+        []
+      ).map((p) => ({
         tMs: p.tMs,
         rate: p.ms,
         n: p.n,
       })),
-      perSessionGaps: report.perSessionGaps || { tMs: [], sessions: [] },
+      perSessionGaps:
+        report.perSessionGapsFull ||
+        report.perSessionGaps || { tMs: [], sessions: [] },
     },
   };
 }
 
 /**
- * Main: burst-open all → wait until all updating → observe/graph over time → close.
+ * Main load test. Burst closes all at once after observe; ramp ramps down
+ * one session per addIntervalMs after the observe hold.
  *
  * @param {object} cfg
  * @param {object[]} wallets
@@ -601,13 +652,21 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   const quiet = Boolean(opts.quiet ?? onProgress);
   const maxConcurrency = Math.min(
     1000,
-    Math.max(1, Number(cfg.maxConcurrency ?? cfg.cutoff ?? 200) || 200)
+    Math.max(1, Number(cfg.maxConcurrency ?? cfg.cutoff ?? 50) || 50)
   );
-  const observeMs = cfg.observeMs ?? cfg.holdAtPeakMs ?? 2 * 60 * 1000;
+  const mode =
+    String(cfg.mode || "burst").toLowerCase() === "ramp" ? "ramp" : "burst";
+  const addIntervalMs =
+    mode === "ramp"
+      ? Math.max(0, Number(cfg.addIntervalMs ?? 1_000) || 0)
+      : 0;
+  const observeMs = cfg.observeMs ?? cfg.holdAtPeakMs ?? 30_000;
   const readyTimeoutMs = cfg.readyTimeoutMs ?? 2 * 60 * 1000;
   const dashboardIntervalMs = quiet
     ? Math.min(cfg.dashboardIntervalMs ?? 5_000, 5_000)
     : cfg.dashboardIntervalMs ?? 10_000;
+  /** Phase while opening: "burst" or "ramp_up". */
+  const openPhase = mode === "ramp" ? "ramp_up" : "burst";
 
   const log = (...args) => {
     if (!quiet) console.log(...args);
@@ -617,9 +676,23 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     else console.warn(...args);
   };
 
-  log("[loadtest] mode: burst → wait-for-updates → observe");
+  if (mode === "ramp") {
+    log(
+      `[loadtest] mode: ramp_up → ready → hold(observe) → ramp_down` +
+        ` (interval ${fmtMs(addIntervalMs)})`
+    );
+  } else {
+    log("[loadtest] mode: burst → ready → observe → close-all");
+  }
   log(`[loadtest] endpoint=${cfg.endpoint}`);
-  log(`[loadtest] open ${maxConcurrency} path_finds as fast as possible`);
+  if (mode === "ramp") {
+    log(
+      `[loadtest] ramp up: +1 every ${fmtMs(addIntervalMs)} → ${maxConcurrency}, ` +
+        `hold ${fmtMs(observeMs)}, ramp down: −1 every ${fmtMs(addIntervalMs)}`
+    );
+  } else {
+    log(`[loadtest] open ${maxConcurrency} path_finds as fast as possible`);
+  }
   log(
     `[loadtest] ready timeout ${fmtMs(readyTimeoutMs)}  observe ${fmtMs(observeMs)}`
   );
@@ -638,11 +711,14 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   const runStartedAt = Date.now();
   let observeStartT = null;
   let lastProgressAt = 0;
+  /** Live phase for onEvent → progress routing. */
+  let currentPhase = openPhase;
 
   const run = {
     startedAt: new Date().toISOString(),
     endpoint: cfg.endpoint,
-    mode: "burst",
+    mode,
+    addIntervalMs,
     maxConcurrency,
     observeMs,
     readyTimeoutMs,
@@ -662,8 +738,16 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   const emitProgress = (phase, message = null, force = false) => {
     if (!onProgress) return;
     const now = Date.now();
-    // Throttle burst event spam; always allow phase transitions (force)
-    if (!force && phase === "burst" && now - lastProgressAt < 250) return;
+    // Throttle chatty phases; always allow phase transitions (force)
+    if (
+      !force &&
+      (phase === "burst" ||
+        phase === "ramp_up" ||
+        phase === "ramp" ||
+        phase === "ramp_down") &&
+      now - lastProgressAt < 250
+    )
+      return;
     if (!force && phase === "ready" && now - lastProgressAt < 400) return;
     lastProgressAt = now;
     try {
@@ -678,6 +762,8 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
           observeStartT,
           phases: run.phases,
           message,
+          mode,
+          addIntervalMs,
         })
       );
     } catch (err) {
@@ -685,32 +771,37 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     }
   };
 
+  const setPhase = (phase, message = null) => {
+    currentPhase = phase;
+    emitProgress(phase, message, true);
+  };
+
   const onEvent = (evt) => {
     timeline.push({ ...evt, t: Date.now() - runStartedAt });
     if (evt.type === "initial" || evt.type === "error") {
-      emitProgress(observeStartT != null ? "observe" : "burst");
-    } else if (evt.type === "follow_up" && observeStartT != null) {
-      emitProgress("observe");
+      emitProgress(currentPhase);
+    } else if (
+      evt.type === "follow_up" &&
+      (currentPhase === "observe" ||
+        currentPhase === "ready" ||
+        currentPhase === "ramp_up" ||
+        currentPhase === "ramp_down")
+    ) {
+      emitProgress(currentPhase);
     }
   };
 
-  // ── 1. BURST: fire all path_find creates in parallel ──────────────
-  log(
-    `\n[loadtest] BURST: launching ${maxConcurrency} path_find workers in parallel…`
-  );
-  emitProgress("burst", "Launching path_find workers…", true);
-  const burstStartedAt = Date.now();
-
-  const launchPromises = [];
-  for (let n = 1; n <= maxConcurrency; n++) {
+  const launchOne = (n) => {
     const { source, dest } = cursor.next();
     const sessionId = `PF${String(n).padStart(4, "0")}`;
-    const p = startPathFindWorker({
+    // Ramp: concurrency grows with n; burst: target is always max
+    const concurrencyAtStart = mode === "ramp" ? n : maxConcurrency;
+    return startPathFindWorker({
       endpoint: cfg.endpoint,
       sourceWallet: source,
       destWallet: dest,
       sessionId,
-      concurrencyAtStart: maxConcurrency,
+      concurrencyAtStart,
       getOpenCount,
       onEvent,
       selfPathFind: cfg.selfPathFind !== false,
@@ -731,31 +822,81 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
             `open=${countOpenWorkers(workers)}/${maxConcurrency}`
         );
       }
-      emitProgress("burst");
+      emitProgress(openPhase);
       return worker;
     });
-    launchPromises.push(p);
-  }
+  };
 
-  await Promise.all(launchPromises);
-  const burstMs = Date.now() - burstStartedAt;
-  run.phases.burst = {
-    durationMs: burstMs,
+  // ── 1. OPEN: burst (all at once) or ramp_up (+1 every addIntervalMs) ──
+  if (mode === "ramp") {
+    log(
+      `\n[loadtest] RAMP UP: +1 path_find every ${fmtMs(addIntervalMs)} → ${maxConcurrency}…`
+    );
+    log(
+      "[loadtest] ramp up awaits each create before the next interval (true +1 concurrency / step)"
+    );
+    setPhase(
+      "ramp_up",
+      `Ramping up: +1 path_find every ${fmtMs(addIntervalMs)}…`
+    );
+  } else {
+    log(
+      `\n[loadtest] BURST: launching ${maxConcurrency} path_find workers in parallel…`
+    );
+    setPhase("burst", "Launching path_find workers…");
+  }
+  const openStartedAt = Date.now();
+
+  if (mode === "ramp") {
+    // Sequential: fully open (or fail) one session, then wait, then next.
+    // Fire-and-forget every N ms piles up in-flight creates; under load they
+    // complete in a clump and the charts look like a sudden burst at the end.
+    for (let n = 1; n <= maxConcurrency; n++) {
+      await launchOne(n);
+      emitProgress(
+        "ramp_up",
+        `Open ${countOpenWorkers(workers)}/${maxConcurrency}` +
+          (n < maxConcurrency
+            ? ` — next in ${fmtMs(addIntervalMs)}`
+            : " — at cap")
+      );
+      if (n < maxConcurrency && addIntervalMs > 0) {
+        await sleep(addIntervalMs);
+      }
+    }
+  } else {
+    const launchPromises = [];
+    for (let n = 1; n <= maxConcurrency; n++) {
+      launchPromises.push(launchOne(n));
+    }
+    await Promise.all(launchPromises);
+  }
+  const openMs = Date.now() - openStartedAt;
+  const openStats = {
+    durationMs: openMs,
     opened: countOpenWorkers(workers),
     failed: workers.filter((w) => w.state.failed).length,
+    addIntervalMs: mode === "ramp" ? addIntervalMs : 0,
   };
+  run.phases[openPhase] = openStats;
+  // Alias for older UI that looked for phases.ramp
+  if (mode === "ramp") run.phases.ramp = openStats;
   log(
-    `\n[loadtest] burst done in ${fmtMs(burstMs)}: ` +
-      `open=${run.phases.burst.opened} failed=${run.phases.burst.failed}`
+    `\n[loadtest] ${mode === "ramp" ? "ramp up" : "burst"} done in ${fmtMs(openMs)}: ` +
+      `open=${openStats.opened} failed=${openStats.failed}`
   );
   if (!quiet) printBurstProgress({ workers, maxConcurrency, timeline });
-  emitProgress("burst", "Burst complete", true);
+  emitProgress(
+    openPhase,
+    mode === "ramp" ? "Ramp up complete — at cap" : "Burst complete",
+    true
+  );
 
   // ── 2. READY: hold until every open session has ≥1 async update ───
   log(
     `\n[loadtest] READY: waiting until all open sessions emit updates (timeout ${fmtMs(readyTimeoutMs)})…`
   );
-  emitProgress("ready", "Waiting for async updates…", true);
+  setPhase("ready", "Waiting for async updates…");
   const readyStartedAt = Date.now();
   let allReady = false;
 
@@ -801,17 +942,23 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   if (!quiet) printBurstProgress({ workers, maxConcurrency, timeline });
   emitProgress("ready", allReady ? "All sessions updating" : "Ready timeout", true);
 
-  // ── 3. OBSERVE: graph responses over time ─────────────────────────
+  // ── 3. OBSERVE / HOLD AT CAP ──────────────────────────────────────
   observeStartT = Date.now() - runStartedAt;
   run.phases.observe = {
     startT: observeStartT,
     durationMs: observeMs,
   };
-  emitProgress("observe", "Observing responses…", true);
+  setPhase(
+    "observe",
+    mode === "ramp"
+      ? `Holding at cap for ${fmtMs(observeMs)}…`
+      : "Observing responses…"
+  );
 
   if (observeMs > 0 && countOpenWorkers(workers) > 0) {
     log(
-      `\n[loadtest] OBSERVE: graphing responses for ${fmtMs(observeMs)}…`
+      `\n[loadtest] ${mode === "ramp" ? "HOLD/OBSERVE" : "OBSERVE"}: ` +
+        `at open=${countOpenWorkers(workers)} for ${fmtMs(observeMs)}…`
     );
     const observeEnd = Date.now() + observeMs;
     let nextDash = Date.now();
@@ -842,15 +989,71 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
         runStartedAt,
       });
     }
-    emitProgress("observe", "Observe complete", true);
+    emitProgress(
+      "observe",
+      mode === "ramp" ? "Hold complete — ramping down" : "Observe complete",
+      true
+    );
   } else {
     log("[loadtest] observe window is 0 or no open sessions — skipping");
   }
 
-  // ── close all ─────────────────────────────────────────────────────
-  emitProgress("closing", "Closing sessions…", true);
-  log(`\n[loadtest] closing ${workers.length} path_find sessions…`);
-  await Promise.all(workers.map((w) => w.stop()));
+  // ── 4. CLOSE: ramp down (mode=ramp) or close-all (burst) ──────────
+  if (mode === "ramp") {
+    log(
+      `\n[loadtest] RAMP DOWN: −1 path_find every ${fmtMs(addIntervalMs)}…`
+    );
+    setPhase(
+      "ramp_down",
+      `Ramping down: −1 path_find every ${fmtMs(addIntervalMs)}…`
+    );
+    const rampDownStartedAt = Date.now();
+    let closedCount = 0;
+
+    // Close newest-first so open count falls from cap → 0
+    while (true) {
+      const openList = workers.filter(
+        (w) => w.state.initial && !w.state.closed && !w.state.failed
+      );
+      if (!openList.length) break;
+
+      const w = openList[openList.length - 1];
+      const remainingAfter = openList.length - 1;
+      if (!quiet) {
+        console.log(
+          `  [${w.sessionId}] CLOSE  open→${remainingAfter}/${maxConcurrency}`
+        );
+      }
+      await w.stop();
+      closedCount++;
+      emitProgress(
+        "ramp_down",
+        `Closed ${w.sessionId} — ${remainingAfter}/${maxConcurrency} open`
+      );
+
+      if (remainingAfter > 0 && addIntervalMs > 0) {
+        await sleep(addIntervalMs);
+      }
+    }
+
+    // Sweep any failed / never-opened workers
+    await Promise.all(workers.map((w) => w.stop()));
+
+    const rampDownMs = Date.now() - rampDownStartedAt;
+    run.phases.ramp_down = {
+      durationMs: rampDownMs,
+      closed: closedCount,
+      addIntervalMs,
+    };
+    log(
+      `[loadtest] ramp down done in ${fmtMs(rampDownMs)}: closed ${closedCount} sessions`
+    );
+    emitProgress("ramp_down", "Ramp down complete", true);
+  } else {
+    setPhase("closing", "Closing sessions…");
+    log(`\n[loadtest] closing ${workers.length} path_find sessions…`);
+    await Promise.all(workers.map((w) => w.stop()));
+  }
 
   run.endedAt = new Date().toISOString();
   run.timeline = timeline;
@@ -864,7 +1067,7 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     printFinalReport(run);
   }
 
-  emitProgress("done", "Run complete", true);
+  setPhase("done", "Run complete");
 
   if (!quiet) {
     if (cfg.inspect && process.stdin.isTTY && process.stdout.isTTY) {
@@ -884,6 +1087,7 @@ function buildReport(run) {
   const creates = createResponseSeries(run.timeline);
   const createOverTime = createLatencyOverTime(run.timeline);
   const observeStartT = run.observeStartT ?? 0;
+  // Observe-window-only (for hold-at-cap stats / terminal dashboards)
   const gaps = updateGapOverTime(run.timeline, { sinceT: observeStartT });
   const gapBuckets = bucketTimeSeries(gaps, UPDATE_BUCKET_MS);
   const rates = updateRateOverTime(run.timeline, {
@@ -894,11 +1098,24 @@ function buildReport(run) {
     sinceT: observeStartT,
     bucketMs: UPDATE_BUCKET_MS,
   });
+  // Full run (for UI charts that shade the observe window across phases)
+  const gapsFull = updateGapOverTime(run.timeline, { sinceT: 0 });
+  const gapBucketsFull = bucketTimeSeries(gapsFull, UPDATE_BUCKET_MS);
+  const ratesFull = updateRateOverTime(run.timeline, {
+    sinceT: 0,
+    bucketMs: UPDATE_BUCKET_MS,
+  });
+  const perSessionGapsFull = perSessionUpdateGaps(run.timeline, {
+    sinceT: 0,
+    bucketMs: UPDATE_BUCKET_MS,
+  });
   return {
     endpoint: run.endpoint,
     mode: run.mode || "burst",
+    addIntervalMs: run.addIntervalMs ?? 0,
     maxConcurrency: run.maxConcurrency,
     observeMs: run.observeMs,
+    observeStartT: run.observeStartT ?? null,
     readyTimeoutMs: run.readyTimeoutMs,
     phases: run.phases,
     startedAt: run.startedAt,
@@ -911,6 +1128,9 @@ function buildReport(run) {
     updateGapBuckets: gapBuckets,
     updateRateOverTime: rates,
     perSessionGaps,
+    updateGapBucketsFull: gapBucketsFull,
+    updateRateOverTimeFull: ratesFull,
+    perSessionGapsFull,
     buckets: run.buckets,
   };
 }
@@ -927,19 +1147,37 @@ function printFinalReport(run) {
   });
 
   console.log("── phases ──");
+  const rampUp = run.phases?.ramp_up || run.phases?.ramp;
+  if (rampUp) {
+    console.log(
+      `  ramp_up:   ${fmtMs(rampUp.durationMs)}  open=${rampUp.opened} failed=${rampUp.failed}` +
+        (rampUp.addIntervalMs ? `  interval=${fmtMs(rampUp.addIntervalMs)}` : "")
+    );
+  }
   if (run.phases?.burst) {
     console.log(
-      `  burst:  ${fmtMs(run.phases.burst.durationMs)}  open=${run.phases.burst.opened} failed=${run.phases.burst.failed}`
+      `  burst:     ${fmtMs(run.phases.burst.durationMs)}  open=${run.phases.burst.opened} failed=${run.phases.burst.failed}`
     );
   }
   if (run.phases?.ready) {
     console.log(
-      `  ready:  ${fmtMs(run.phases.ready.durationMs)}  updating=${run.phases.ready.updating}/${run.phases.ready.open}` +
+      `  ready:     ${fmtMs(run.phases.ready.durationMs)}  updating=${run.phases.ready.updating}/${run.phases.ready.open}` +
         (run.phases.ready.allReady ? "  (all ready)" : "  (timeout)")
     );
   }
   if (run.phases?.observe) {
-    console.log(`  observe: ${fmtMs(run.phases.observe.durationMs)}`);
+    console.log(
+      `  observe:   ${fmtMs(run.phases.observe.durationMs)}` +
+        (run.mode === "ramp" ? "  (hold at cap)" : "")
+    );
+  }
+  if (run.phases?.ramp_down) {
+    console.log(
+      `  ramp_down: ${fmtMs(run.phases.ramp_down.durationMs)}  closed=${run.phases.ramp_down.closed}` +
+        (run.phases.ramp_down.addIntervalMs
+          ? `  interval=${fmtMs(run.phases.ramp_down.addIntervalMs)}`
+          : "")
+    );
   }
   console.log("");
 

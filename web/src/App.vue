@@ -92,8 +92,11 @@ async function onStart(opts) {
     const started = await startRun(opts);
     activeRunId.value = started.id;
     liveMeta.value = started;
+    const startMode = started.config?.mode === "ramp" ? "ramp" : "burst";
     liveProgress.value = {
-      phase: "burst",
+      phase: startMode === "ramp" ? "ramp_up" : "burst",
+      mode: startMode,
+      addIntervalMs: started.config?.addIntervalMs ?? 0,
       maxConcurrency: started.config.maxConcurrency,
       observeMs: started.config.observeMs,
       opened: 0,

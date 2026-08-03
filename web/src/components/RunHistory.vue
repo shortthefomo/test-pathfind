@@ -33,6 +33,7 @@ function isChecked(id, selected) {
           <tr>
             <th></th>
             <th>Label</th>
+            <th>Mode</th>
             <th>Max</th>
             <th>Observe</th>
             <th>Opened</th>
@@ -66,6 +67,15 @@ function isChecked(id, selected) {
             <td class="label-cell">
               <strong>{{ r.label }}</strong>
               <span class="status-tag" :class="r.status">{{ r.status }}</span>
+            </td>
+            <td class="muted">
+              <template v-if="r.config?.mode === 'ramp'">
+                ramp
+                <span v-if="r.config?.addIntervalMs">
+                  /{{ fmtMs(r.config.addIntervalMs) }}
+                </span>
+              </template>
+              <template v-else>burst</template>
             </td>
             <td>{{ r.config?.maxConcurrency ?? "—" }}</td>
             <td>{{ fmtMs(r.config?.observeMs) }}</td>

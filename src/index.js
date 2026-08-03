@@ -2,14 +2,17 @@
  * XRPL path_find load-test client
  *
  * 1. Discover (or load cached) wallets with ≥200 funded trustlines
- * 2. Burst-open all path_finds as fast as possible
+ * 2. Open path_finds up to --max:
+ *      burst — all at once, or
+ *      ramp  — +1 every N sec, hold for observe, then −1 every N sec
  * 3. Hold until every open session is emitting async updates
- * 4. Observe for N minutes (default 2) and graph responses over time
+ * 4. Observe / hold at cap, then close (burst: all; ramp: gradual)
  *
  * Usage:
  *   node src/index.js --skipDiscover
  *   node src/index.js --skipDiscover --max=200 --observeMin=2
  *   node src/index.js --skipDiscover --max=10 --observeSec=30
+ *   node src/index.js --skipDiscover --mode=ramp --addIntervalSec=3 --max=50
  */
 
 import path from "node:path";
@@ -22,13 +25,19 @@ function printHelp() {
   console.log(`
 xrpl-pathfind-loadtest
 
-Burst path_find load test against a rippled WebSocket (xrpl-client).
+path_find load test against a rippled WebSocket (xrpl-client).
 
-Phases:
-  1. Open --max path_finds in parallel (as fast as possible)
-  2. Hold until every successful session is receiving async updates
-  3. Graph update gaps / throughput over --observeMin minutes (default 2)
-  4. Close all sessions and print the final report
+Phases (burst):
+  1. Open --max path_finds in parallel
+  2. Wait until sessions receive async updates
+  3. Hold/observe for --observeMin (default 2)
+  4. Close all at once
+
+Phases (ramp):
+  1. Ramp up: +1 path_find every --addIntervalSec until --max
+  2. Wait until sessions receive async updates
+  3. Hold at cap for observe window
+  4. Ramp down: −1 path_find every --addIntervalSec until none remain
 
 Options:
   --endpoint=URL              WebSocket URL (default: ${DEFAULTS.endpoint})
@@ -36,9 +45,12 @@ Options:
   --resultsDir=PATH           Metrics output directory (default: ${DEFAULTS.resultsDir})
   --walletPoolSize=N          Qualifying wallets to collect (default: ${DEFAULTS.walletPoolSize})
   --minTrustlinesWithBalance  Funded trustline threshold (default: ${DEFAULTS.minTrustlinesWithBalance})
-  --max=200                   Concurrent open path_finds (alias: --cutoff)
-  --observeMin=2              Observe/graph window in minutes (default: 2)
-  --observeSec=N              Observe window in seconds (overrides --observeMin)
+  --max=50                    Max concurrent open path_finds (alias: --cutoff)
+  --mode=burst|ramp           Strategy (default: ramp)
+  --addIntervalSec=1          Ramp: seconds between +1 up / −1 down (default: 1)
+  --addIntervalMs=N           Ramp: same as above, in milliseconds
+  --observeMin=N              Hold-at-cap / observe window in minutes
+  --observeSec=30             Observe window in seconds (default: 30)
   --readyTimeoutSec=120       Max wait for all sessions to start updating
   --skipDiscover              Reuse walletsFile
   --rediscover                Force fresh discovery
@@ -49,6 +61,7 @@ Options:
 Examples:
   npm start -- --skipDiscover --max=200 --observeMin=2
   npm start -- --skipDiscover --max=10 --observeSec=30
+  npm start -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeSec=60
   npm run discover -- --walletPoolSize=20
 `);
 }
@@ -77,6 +90,9 @@ async function main() {
     minTrustlinesWithBalance:
       args.minTrustlinesWithBalance ?? DEFAULTS.minTrustlinesWithBalance,
     maxConcurrency: args.max ?? args.cutoff ?? args.maxConcurrency,
+    mode: args.mode,
+    addIntervalMs: args.addIntervalMs,
+    addIntervalSec: args.addIntervalSec,
     observeMs: args.observeMs,
     observeMin: args.observeMin,
     observeSec: args.observeSec,
@@ -91,10 +107,14 @@ async function main() {
     inspect: Boolean(args.inspect),
   });
 
-  console.log("═══ XRPL path_find load test (burst → ready → observe) ═══");
+  console.log(
+    `═══ XRPL path_find load test (${cfg.mode} → ready → observe) ═══`
+  );
   console.log("config:", {
     endpoint: cfg.endpoint,
     walletsFile: cfg.walletsFile,
+    mode: cfg.mode,
+    addIntervalMs: cfg.mode === "ramp" ? cfg.addIntervalMs : undefined,
     maxConcurrency: cfg.maxConcurrency,
     observeMs: cfg.observeMs,
     readyTimeoutMs: cfg.readyTimeoutMs,

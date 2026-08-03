@@ -11,16 +11,31 @@ export const DEFAULTS = {
   walletPoolSize: 20,
 
   /**
-   * Burst mode: open this many path_finds as fast as possible (all at once),
-   * wait until every successful session is emitting async updates, then observe.
+   * Cap: open this many concurrent path_finds (burst all-at-once, or ramp up
+   * one-by-one until this ceiling).
    */
-  maxConcurrency: 200,
+  maxConcurrency: 50,
+
+  /**
+   * Open strategy:
+   *   "burst" — fire all path_find creates in parallel, observe, close all
+   *   "ramp"  — ramp up (+1 / addIntervalMs) → hold at cap for observeMs →
+   *             ramp down (−1 / same interval)
+   */
+  mode: "ramp",
+
+  /**
+   * Ramp spacing (mode=ramp only): after each path_find fully opens (create
+   * reply), wait this long before opening the next; same interval between
+   * closes on the way down. Default 1s. CLI: --addIntervalSec / --addIntervalMs.
+   */
+  addIntervalMs: 1_000,
 
   /**
    * After all sessions are updating, keep them open and graph responses
-   * over this window (default 2 minutes). CLI: --observeMin / --observeSec.
+   * over this window (default 30s). CLI: --observeMin / --observeSec.
    */
-  observeMs: 2 * 60 * 1000,
+  observeMs: 30_000,
 
   /**
    * Max time to wait for every open session to receive at least one async
@@ -31,13 +46,10 @@ export const DEFAULTS = {
   /** How often to refresh the live time-series dashboard during observe */
   dashboardIntervalMs: 10_000,
 
-  /** @deprecated gradual ramp — ignored; opens are burst-fired */
-  addIntervalMs: 0,
-
   /** @deprecated alias of observeMs for older flags */
-  holdAtPeakMs: 2 * 60 * 1000,
+  holdAtPeakMs: 30_000,
 
-  /** @deprecated old ratchet levels — ignored by burst mode */
+  /** @deprecated old ratchet levels — ignored */
   concurrencyLevels: [10, 25, 50, 75, 100, 150, 200],
 
   settleMs: 10_000,
@@ -168,6 +180,22 @@ export function resolveConfig(overrides = {}) {
   // aliases
   if (cfg.max !== undefined) cfg.maxConcurrency = Number(cfg.max);
   if (cfg.cutoff !== undefined) cfg.maxConcurrency = Number(cfg.cutoff);
+
+  // mode: accept ramp / burst; infer ramp if addInterval was explicitly set
+  if (typeof cfg.mode === "string") {
+    cfg.mode = cfg.mode.toLowerCase().trim();
+  }
+  const intervalExplicit =
+    clean.addIntervalMs !== undefined || clean.addIntervalSec !== undefined;
+  if (clean.mode === undefined && intervalExplicit && Number(cfg.addIntervalMs) > 0) {
+    cfg.mode = "ramp";
+  } else if (cfg.mode !== "burst" && cfg.mode !== "ramp") {
+    cfg.mode = "burst";
+  }
+  if (cfg.mode === "ramp") {
+    const interval = Number(cfg.addIntervalMs);
+    if (!Number.isFinite(interval) || interval < 0) cfg.addIntervalMs = 1_000;
+  }
 
   for (const key of [
     "walletPoolSize",

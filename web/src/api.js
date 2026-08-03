@@ -86,16 +86,17 @@ export function sessionColor(i, total = 1, alpha = 0.85) {
 
 /**
  * Build Chart.js datasets that overlay every path_find session's update gaps.
+ * Labels use absolute run time so an observe-window band can be aligned.
  * @param {{ tMs?: number[], sessions?: Array<{ sessionId: string, values: (number|null)[] }> }} perSession
  */
 export function buildPerSessionOverlay(perSession) {
   const tMs = perSession?.tMs || [];
   const sessions = perSession?.sessions || [];
   if (!tMs.length || !sessions.length) {
-    return { labels: [], datasets: [], sessionCount: 0 };
+    return { labels: [], datasets: [], sessionCount: 0, pointTMs: [] };
   }
-  const t0 = tMs[0];
-  const labels = tMs.map((t) => ((t - t0) / 1000).toFixed(0) + "s");
+  // Absolute run time (not relative to first bucket) so observe shading lines up
+  const labels = tMs.map((t) => (t / 1000).toFixed(0) + "s");
   const n = sessions.length;
   const showLegend = n <= 16;
   const datasets = sessions.map((s, i) => ({
@@ -110,5 +111,69 @@ export function buildPerSessionOverlay(perSession) {
     spanGaps: true,
     fill: false,
   }));
-  return { labels, datasets, sessionCount: n, showLegend };
+  return { labels, datasets, sessionCount: n, showLegend, pointTMs: tMs };
+}
+
+/**
+ * Build observe-window descriptor for LineChart from progress/summary.
+ * @returns {{ startMs: number, endMs: number, label: string } | null}
+ */
+export function buildObserveWindow(src) {
+  if (!src) return null;
+  const start =
+    src.observeStartT ??
+    src.observeWindow?.startMs ??
+    null;
+  const end =
+    src.observeEndT ??
+    (start != null && src.observeMs != null ? start + src.observeMs : null) ??
+    src.observeWindow?.endMs ??
+    null;
+  if (start == null || end == null || !(end > start)) return null;
+  return {
+    startMs: start,
+    endMs: end,
+    label: "Observe window",
+  };
+}
+
+/**
+ * Ensure the category X axis spans the observe window so the band is visible
+ * even when the series only has pre-observe points (e.g. create latencies).
+ * Pads with null data at observe start/end when needed.
+ *
+ * @param {{ labels: string[], pointTMs: number[], data: (number|null)[] }} series
+ * @param {{ startMs: number, endMs: number } | null} observeWindow
+ */
+export function padSeriesForObserveWindow(series, observeWindow) {
+  if (!observeWindow || observeWindow.startMs == null || observeWindow.endMs == null) {
+    return series;
+  }
+  const { startMs, endMs } = observeWindow;
+  let labels = [...(series.labels || [])];
+  let pointTMs = [...(series.pointTMs || [])];
+  let data = [...(series.data || [])];
+
+  const fmt = (t) => (t / 1000).toFixed(t % 1000 === 0 ? 0 : 1) + "s";
+
+  if (!pointTMs.length) {
+    return {
+      labels: [fmt(startMs), fmt(endMs)],
+      pointTMs: [startMs, endMs],
+      data: [null, null],
+    };
+  }
+
+  if (pointTMs[0] > startMs) {
+    labels = [fmt(startMs), ...labels];
+    pointTMs = [startMs, ...pointTMs];
+    data = [null, ...data];
+  }
+  if (pointTMs[pointTMs.length - 1] < endMs) {
+    labels = [...labels, fmt(endMs)];
+    pointTMs = [...pointTMs, endMs];
+    data = [...data, null];
+  }
+
+  return { labels, pointTMs, data };
 }

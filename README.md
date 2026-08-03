@@ -1,6 +1,6 @@
 # XRPL `path_find` load test
 
-Burst load-tester for rippled/clio pathfinding, with a **Vue 3** dashboard for multi-round runs and fall-off comparison.
+Load-tester for rippled/clio pathfinding, with a **Vue 3** dashboard for multi-round runs and fall-off comparison. Supports **burst** (all at once) and **ramp** (up → hold → down).
 
 ## Modes
 
@@ -15,10 +15,17 @@ Default node: `ws://192.168.12.238:6006`
 
 ## How a round works
 
-1. **Burst** — open all path_finds in parallel (as fast as possible)
-2. **Ready** — wait until every successful session emits async updates
-3. **Observe** — keep them open and graph metrics for N seconds (default 2 min)
-4. Close sessions; store summary for history/compare
+### Burst
+1. Open all path_finds in parallel (as fast as possible)
+2. **Ready** — wait until sessions emit async updates
+3. **Observe** — hold and graph metrics for N seconds
+4. Close all at once
+
+### Ramp
+1. **Ramp up** — open +1 path_find every interval (default 3s) until max concurrent
+2. **Ready** — wait until sessions emit async updates
+3. **Hold / observe** — keep all open at the cap for the observe window
+4. **Ramp down** — close −1 path_find every **same** interval until none remain
 
 ## Vue dashboard
 
@@ -30,11 +37,13 @@ npm run dev
 
 Open **http://localhost:5173**
 
-- Pick **max** 10 / 50 / 200 or custom up to **1000**
-- Set **observe** 30s / 1m / 2m / 5m or custom
+- Defaults: **Ramp**, **1s** interval, **max 50**, **hold 30s**
+- Pick **open mode**: Burst or Ramp
+- Ramp: set **interval** (used for both ramp-up and ramp-down)
+- Pick **max** concurrent path_finds (the cap)
+- Set **observe** window (hold time at cap in ramp mode)
 - **Fire test round** — live charts stream over SSE
-- Run another round with different options
-- Multi-select history rows → **Compare** charts (create/gap fall-off vs concurrency, success rate, overlaid time series)
+- Multi-select history rows → **Compare** charts
 
 Only **one** run at a time.
 
@@ -43,14 +52,17 @@ Only **one** run at a time.
 ```bash
 npm run cli -- --skipDiscover --max=200 --observeMin=2
 npm run cli -- --skipDiscover --max=10 --observeSec=30 --inspect
+npm run cli -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeSec=60
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--endpoint` | `ws://192.168.12.238:6006` | WebSocket URL |
-| `--max` / `--cutoff` | `200` | Concurrent path_finds (burst) |
-| `--observeMin` | `2` | Observe window (minutes) |
-| `--observeSec` | | Observe window (seconds) |
+| `--max` / `--cutoff` | `50` | Max concurrent path_finds (cap) |
+| `--mode` | `ramp` | `burst` or `ramp` (up → hold → down) |
+| `--addIntervalSec` | `1` | Ramp: seconds between +1 up and −1 down |
+| `--observeMin` | | Hold-at-cap / observe window (minutes) |
+| `--observeSec` | `30` | Observe / hold-at-cap window (seconds) |
 | `--readyTimeoutSec` | `120` | Max wait for all sessions to update |
 | `--skipDiscover` | | Use `data/wallets.json` |
 | `--inspect` | | Interactive session drill-down after CLI run |

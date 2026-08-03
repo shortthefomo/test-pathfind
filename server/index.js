@@ -111,12 +111,14 @@ async function main() {
     }
 
     const body = req.body || {};
-    let maxConcurrency = Number(body.maxConcurrency ?? 50);
+    let maxConcurrency = Number(body.maxConcurrency ?? DEFAULTS.maxConcurrency ?? 50);
     if (!Number.isFinite(maxConcurrency)) maxConcurrency = 50;
     maxConcurrency = Math.min(1000, Math.max(1, Math.floor(maxConcurrency)));
 
-    let observeSec = Number(body.observeSec ?? 120);
-    if (!Number.isFinite(observeSec) || observeSec < 1) observeSec = 120;
+    let observeSec = Number(
+      body.observeSec ?? Math.round((DEFAULTS.observeMs || 30_000) / 1000)
+    );
+    if (!Number.isFinite(observeSec) || observeSec < 1) observeSec = 30;
     observeSec = Math.min(3600, Math.floor(observeSec));
 
     let readyTimeoutSec = Number(body.readyTimeoutSec ?? 120);
@@ -124,11 +126,29 @@ async function main() {
       readyTimeoutSec = 120;
     }
 
+    const mode =
+      String(body.mode || DEFAULTS.mode || "ramp").toLowerCase() === "burst"
+        ? "burst"
+        : "ramp";
+
+    let addIntervalSec = Number(
+      body.addIntervalSec ?? Math.round((DEFAULTS.addIntervalMs || 1_000) / 1000)
+    );
+    if (!Number.isFinite(addIntervalSec) || addIntervalSec < 0) {
+      addIntervalSec = 1;
+    }
+    // Cap interval so a 1000-cap ramp cannot stall forever (max 60s between opens)
+    addIntervalSec = Math.min(60, addIntervalSec);
+    const addIntervalMs =
+      mode === "ramp" ? Math.round(addIntervalSec * 1000) : 0;
+
     const endpoint = String(body.endpoint || DEFAULTS.endpoint).trim();
     const label = body.label ? String(body.label).slice(0, 80) : null;
 
     const config = {
       endpoint,
+      mode,
+      addIntervalMs,
       maxConcurrency,
       observeMs: observeSec * 1000,
       readyTimeoutMs: readyTimeoutSec * 1000,
@@ -169,7 +189,9 @@ async function main() {
     (async () => {
       try {
         console.log(
-          `[api] starting run ${entry.id} max=${maxConcurrency} observe=${observeSec}s endpoint=${endpoint}`
+          `[api] starting run ${entry.id} mode=${mode}` +
+            (mode === "ramp" ? ` interval=${addIntervalSec}s` : "") +
+            ` max=${maxConcurrency} observe=${observeSec}s endpoint=${endpoint}`
         );
         const fullRun = await runLoadTest(config, wallets, {
           quiet: true,
