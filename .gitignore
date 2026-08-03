@@ -1,0 +1,5 @@
+node_modules/
+data/wallets.json
+data/results/
+.DS_Store
+*.log

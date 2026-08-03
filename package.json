@@ -1,0 +1,37 @@
+{
+  "name": "xrpl-pathfind-loadtest",
+  "version": "1.0.0",
+  "description": "Load test client for XRPL path_find — CLI + Vue dashboard",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node server/index.js",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server/index.js",
+    "cli": "node src/index.js",
+    "loadtest": "node src/loadtest.js",
+    "discover": "node src/discover-wallets.js"
+  },
+  "keywords": [
+    "xrpl",
+    "path_find",
+    "loadtest",
+    "vue"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chart.js": "^4.4.8",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "vue": "^3.5.13",
+    "xrpl-client": "^2.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
