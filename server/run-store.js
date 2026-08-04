@@ -347,32 +347,76 @@ export async function loadFromDisk() {
     /* no index yet */
   }
 
-  // Import orphan summaries from CLI runs (no id in ui-index)
+  // Import orphan summaries from true CLI runs only (not already in ui-index).
+  // UI completeRun writes loadtest-<stamp>.json with id/label and records
+  // resultsPath on the index entry. Matching by stamp/id avoids re-importing
+  // those as fake "N open · CLI" duplicates on every server restart.
   try {
+    const knownStamps = new Set();
+    for (const r of runs.values()) {
+      if (!r.resultsPath) continue;
+      const base = path.basename(r.resultsPath);
+      const m = base.match(/^loadtest-(.+)\.json$/);
+      if (m) knownStamps.add(m[1]);
+    }
+
     const files = await fs.readdir(RESULTS_DIR);
     const summaries = files.filter((f) => f.endsWith("-summary.json"));
     for (const f of summaries.slice(-30)) {
       try {
+        const stamp = f
+          .replace(/^loadtest-/, "")
+          .replace(/-summary\.json$/, "");
+        if (knownStamps.has(stamp)) continue;
+
+        // Prefer full JSON when present: UI runs store id/label there; CLI does not.
+        const fullPath = path.join(RESULTS_DIR, `loadtest-${stamp}.json`);
+        let full = null;
+        try {
+          full = JSON.parse(await fs.readFile(fullPath, "utf8"));
+        } catch {
+          /* summary-only orphan */
+        }
+        if (full?.id && runs.has(full.id)) {
+          // Index entry exists but resultsPath was missing — link it now.
+          const existing = runs.get(full.id);
+          if (existing && !existing.resultsPath) {
+            existing.resultsPath = fullPath;
+          }
+          continue;
+        }
+
         const raw = await fs.readFile(path.join(RESULTS_DIR, f), "utf8");
         const report = JSON.parse(raw);
-        const id = f.replace(/^loadtest-/, "").replace(/-summary\.json$/, "").slice(0, 20);
+
+        const id =
+          (full?.id && String(full.id)) ||
+          `cli-${stamp}`.slice(0, 24);
         if (runs.has(id)) continue;
+
+        const isUiArtifact = Boolean(full?.id || full?.label);
+        const label =
+          full?.label ||
+          (isUiArtifact
+            ? `${report.maxConcurrency} open`
+            : `${report.maxConcurrency} open · CLI`);
+
         // Build a pseudo-run for summarizeRunForUi
         const pseudo = {
-          startedAt: report.startedAt,
-          endedAt: report.endedAt,
-          endpoint: report.endpoint,
-          maxConcurrency: report.maxConcurrency,
-          observeMs: report.observeMs,
-          readyTimeoutMs: report.readyTimeoutMs,
-          phases: report.phases,
+          startedAt: report.startedAt || full?.startedAt,
+          endedAt: report.endedAt || full?.endedAt,
+          endpoint: report.endpoint || full?.endpoint,
+          maxConcurrency: report.maxConcurrency ?? full?.maxConcurrency,
+          observeMs: report.observeMs ?? full?.observeMs,
+          readyTimeoutMs: report.readyTimeoutMs ?? full?.readyTimeoutMs,
+          phases: report.phases || full?.phases,
           sessions: [],
           timeline: [],
           report,
         };
         const summary = summarizeRunForUi(pseudo, {
           id,
-          label: `${report.maxConcurrency} open · CLI`,
+          label,
           status: "done",
         });
         // Prefer series already on report
@@ -400,12 +444,15 @@ export async function loadFromDisk() {
           id,
           label: summary.label,
           status: "done",
-          startedAt: report.startedAt,
-          endedAt: report.endedAt,
+          startedAt: report.startedAt || full?.startedAt,
+          endedAt: report.endedAt || full?.endedAt,
           config: summary.config,
           progress: null,
           summary,
           error: null,
+          requestPlan: null,
+          replayOf: full?.replayOf || null,
+          resultsPath: full ? fullPath : null,
           listeners: new Set(),
           fullRun: null,
         });
