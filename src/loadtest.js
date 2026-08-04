@@ -581,6 +581,105 @@ export function buildProgressSnapshot({
 }
 
 /**
+ * Prefer full-run chart series from a saved report / summary JSON.
+ * Older ui-index entries and CLI imports sometimes stored observe-window-only
+ * buckets under series.updateGapBuckets, which makes reopened charts wrong.
+ *
+ * @param {object|null} summary  UI summary (mutated in place)
+ * @param {object|null} report   report or *-summary.json body
+ * @returns {object|null}
+ */
+export function applyReportSeriesToSummary(summary, report) {
+  if (!summary || !report || typeof report !== "object") return summary;
+  if (!summary.series) summary.series = {};
+
+  if (Array.isArray(report.createLatencyOverTime) && report.createLatencyOverTime.length) {
+    summary.series.createOverTime = report.createLatencyOverTime.map((p) => ({
+      tMs: p.tMs,
+      ms: p.ms,
+      sessionId: p.sessionId,
+    }));
+  }
+
+  // Full-run preferred — observe-only fallback
+  const gapSrc =
+    (Array.isArray(report.updateGapBucketsFull) && report.updateGapBucketsFull.length
+      ? report.updateGapBucketsFull
+      : null) ||
+    (Array.isArray(report.updateGapBuckets) && report.updateGapBuckets.length
+      ? report.updateGapBuckets
+      : null);
+  if (gapSrc) {
+    summary.series.updateGapBuckets = gapSrc.map((p) => ({
+      tMs: p.tMs,
+      ms: p.ms,
+      n: p.n,
+    }));
+  }
+
+  const rateSrc =
+    (Array.isArray(report.updateRateOverTimeFull) &&
+    report.updateRateOverTimeFull.length
+      ? report.updateRateOverTimeFull
+      : null) ||
+    (Array.isArray(report.updateRateOverTime) && report.updateRateOverTime.length
+      ? report.updateRateOverTime
+      : null);
+  if (rateSrc) {
+    summary.series.updateRateBuckets = rateSrc.map((p) => ({
+      tMs: p.tMs,
+      rate: p.ms != null ? p.ms : p.rate,
+      n: p.n,
+    }));
+  }
+
+  const perSrc = report.perSessionGapsFull || report.perSessionGaps;
+  if (perSrc && Array.isArray(perSrc.tMs)) {
+    summary.series.perSessionGaps = perSrc;
+  }
+
+  if (report.observeStartT != null) summary.observeStartT = report.observeStartT;
+  if (report.observeMs != null && summary.config) {
+    summary.config.observeMs = report.observeMs;
+  }
+  if (
+    summary.observeStartT != null &&
+    (summary.config?.observeMs != null || report.observeMs != null)
+  ) {
+    const obsMs = summary.config?.observeMs ?? report.observeMs;
+    summary.observeEndT = summary.observeStartT + obsMs;
+  }
+
+  if (report.consensus && !summary.consensus) {
+    summary.consensus = report.consensus;
+  }
+  if (report.consensus?.series && !summary.series.serverState?.length) {
+    summary.series.serverState = report.consensus.series.map((p) => ({
+      tMs: p.tMs,
+      state: p.server_state,
+      rank: p.stateRank,
+      healthy: p.healthy,
+      validatedSeq: p.validatedSeq,
+      ledgerAge: p.ledgerAge,
+      loadFactor: p.loadFactor,
+      peers: p.peers,
+      convergeTimeS: p.convergeTimeS,
+      proposers: p.proposers,
+      txInMemory: p.txInMemory,
+      writeLoad: p.writeLoad,
+      PathFindTrustLine: p.PathFindTrustLine ?? null,
+      PathRequest: p.PathRequest ?? null,
+      STPath: p.STPath ?? null,
+      STPathElement: p.STPathElement ?? null,
+      STPathSet: p.STPathSet ?? null,
+      pathfind: p.pathfind || null,
+    }));
+  }
+
+  return summary;
+}
+
+/**
  * Compact summary for UI history + comparison (no fullReply blobs).
  */
 export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {

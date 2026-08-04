@@ -18,6 +18,7 @@ import {
   loadFromDisk,
   listRuns,
   getRun,
+  getRunHydrated,
   createRunRecord,
   claimActive,
   releaseActive,
@@ -85,8 +86,8 @@ async function main() {
     res.json({ runs: listRuns(), activeRunId: getActiveRunId() });
   });
 
-  app.get("/api/runs/:id", (req, res) => {
-    const entry = getRun(req.params.id);
+  app.get("/api/runs/:id", async (req, res) => {
+    const entry = await getRunHydrated(req.params.id);
     if (!entry) return res.status(404).json({ error: "run not found" });
     const { listeners, fullRun, ...rest } = entry;
     res.json(rest);

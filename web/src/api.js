@@ -223,8 +223,13 @@ export function padSeriesForObserveWindow(series, observeWindow) {
 }
 
 /**
- * Extend a series' time axis so vertical markers (e.g. every +10 path_finds)
- * fall inside the plotted range. Pads with null y-values at marker times.
+ * Extend a series' time axis so vertical markers can be drawn, without
+ * inserting every marker as its own category slot (that breaks time scale
+ * on Chart.js category axes — equal width per point).
+ *
+ * Only pads the first/last bound if markers fall outside the series range.
+ * Interior markers are placed by the LineChart timeMarkers plugin via
+ * interpolation on pointTMs.
  *
  * @param {{ labels: string[], pointTMs: number[], data: (number|null)[] }} series
  * @param {Array<{ tMs: number }>|null|undefined} markers
@@ -243,58 +248,28 @@ export function padSeriesForTimeMarkers(series, markers) {
     .sort((a, b) => a - b);
   if (!times.length) return series;
 
+  const minM = times[0];
+  const maxM = times[times.length - 1];
+
   if (!pointTMs.length) {
+    // No gap data yet — minimal axis so markers can still render
     return {
-      labels: times.map(fmt),
-      pointTMs: times,
-      data: times.map(() => null),
+      labels: [fmt(minM), fmt(maxM)],
+      pointTMs: [minM, maxM],
+      data: [null, null],
     };
   }
 
-  // Prepend markers / times before first point
-  const pre = [];
-  for (const t of times) {
-    if (t < pointTMs[0]) pre.push(t);
+  // Single pad at earliest marker (not one category per +10 open)
+  if (minM < pointTMs[0] - 1) {
+    labels = [fmt(minM), ...labels];
+    pointTMs = [minM, ...pointTMs];
+    data = [null, ...data];
   }
-  // unique-ish sorted pre
-  const preUnique = [...new Set(pre)].sort((a, b) => a - b);
-  if (preUnique.length) {
-    labels = [...preUnique.map(fmt), ...labels];
-    pointTMs = [...preUnique, ...pointTMs];
-    data = [...preUnique.map(() => null), ...data];
-  }
-
-  // Append markers after last point
-  const post = [];
-  for (const t of times) {
-    if (t > pointTMs[pointTMs.length - 1]) post.push(t);
-  }
-  const postUnique = [...new Set(post)].sort((a, b) => a - b);
-  if (postUnique.length) {
-    labels = [...labels, ...postUnique.map(fmt)];
-    pointTMs = [...pointTMs, ...postUnique];
-    data = [...data, ...postUnique.map(() => null)];
-  }
-
-  // Insert interior marker times that fall between existing buckets (for
-  // accurate vertical placement when gaps are sparse)
-  for (const t of times) {
-    // binary-ish scan: skip if already very close to an existing point
-    let exists = false;
-    for (let i = 0; i < pointTMs.length; i++) {
-      if (Math.abs(pointTMs[i] - t) < 1) {
-        exists = true;
-        break;
-      }
-    }
-    if (exists) continue;
-    // find insert index
-    let idx = pointTMs.findIndex((p) => p > t);
-    if (idx < 0) continue; // would be post — already handled
-    if (idx === 0) continue; // would be pre — already handled
-    labels.splice(idx, 0, fmt(t));
-    pointTMs.splice(idx, 0, t);
-    data.splice(idx, 0, null);
+  if (maxM > pointTMs[pointTMs.length - 1] + 1) {
+    labels = [...labels, fmt(maxM)];
+    pointTMs = [...pointTMs, maxM];
+    data = [...data, null];
   }
 
   return { labels, pointTMs, data };

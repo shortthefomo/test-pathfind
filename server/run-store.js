@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import {
   summarizeRunForUi,
+  applyReportSeriesToSummary,
   saveResults,
   loadRequestPlanFromResultsFile,
 } from "../src/loadtest.js";
@@ -39,6 +40,66 @@ export function listRuns() {
 
 export function getRun(id) {
   return runs.get(id) || null;
+}
+
+/**
+ * Like getRun, but rehydrates chart series from disk when possible.
+ * Prefer this for detail views after server restart.
+ */
+export async function getRunHydrated(id) {
+  const entry = runs.get(id);
+  if (!entry) return null;
+  if (entry.summary && entry.resultsPath && !entry._seriesHydrated) {
+    try {
+      await rehydrateEntrySeries(entry);
+    } catch {
+      /* keep cached */
+    }
+  }
+  return entry;
+}
+
+/**
+ * Re-read results on disk and fix chart series (prefer full-run gap/rate).
+ * Prefer *-summary.json (has updateGapBucketsFull, much smaller than full run).
+ * @param {object} entry
+ */
+async function rehydrateEntrySeries(entry) {
+  if (!entry?.summary) return entry;
+  if (entry._seriesHydrated) return entry;
+
+  let report = null;
+  const candidates = [];
+
+  if (entry.resultsPath) {
+    // Sibling summary first (has Full buckets, not multi‑MB)
+    candidates.push(
+      entry.resultsPath.replace(
+        /loadtest-(.+)\.json$/,
+        "loadtest-$1-summary.json"
+      )
+    );
+    candidates.push(entry.resultsPath); // full JSON as fallback
+  }
+
+  for (const p of candidates) {
+    if (!p) continue;
+    try {
+      const data = JSON.parse(await fs.readFile(p, "utf8"));
+      // full file wraps report; summary file IS the report
+      report = data.report || data;
+      if (report?.updateGapBucketsFull || report?.updateGapBuckets) break;
+      report = null;
+    } catch {
+      /* next candidate */
+    }
+  }
+
+  if (report) {
+    applyReportSeriesToSummary(entry.summary, report);
+  }
+  entry._seriesHydrated = true;
+  return entry;
 }
 
 function stripHeavy(entry) {
@@ -314,7 +375,7 @@ export async function loadFromDisk() {
       for (const item of index) {
         if (!item?.id) continue;
         const plan = normalizeRequestPlan(item.requestPlan);
-        runs.set(item.id, {
+        const entry = {
           id: item.id,
           label: item.label,
           status: item.status || "done",
@@ -325,6 +386,10 @@ export async function loadFromDisk() {
           summary: item.summary
             ? {
                 ...item.summary,
+                // Deep-clone series so rehydrate can replace gap buckets safely
+                series: item.summary.series
+                  ? { ...item.summary.series }
+                  : undefined,
                 canRerun:
                   plan.length > 0 ||
                   item.summary.canRerun ||
@@ -340,7 +405,16 @@ export async function loadFromDisk() {
           resultsPath: item.resultsPath || null,
           listeners: new Set(),
           fullRun: null,
-        });
+        };
+        runs.set(item.id, entry);
+        // Fix observe-only series left in older ui-index entries
+        if (entry.summary && entry.resultsPath) {
+          try {
+            await rehydrateEntrySeries(entry);
+          } catch {
+            entry._seriesHydrated = false;
+          }
+        }
       }
     }
   } catch {
@@ -419,27 +493,9 @@ export async function loadFromDisk() {
           label,
           status: "done",
         });
-        // Prefer series already on report
-        if (report.createLatencyOverTime) {
-          summary.series.createOverTime = report.createLatencyOverTime.map((p) => ({
-            tMs: p.tMs,
-            ms: p.ms,
-          }));
-        }
-        if (report.updateGapBuckets) {
-          summary.series.updateGapBuckets = report.updateGapBuckets.map((p) => ({
-            tMs: p.tMs,
-            ms: p.ms,
-            n: p.n,
-          }));
-        }
-        if (report.updateRateOverTime) {
-          summary.series.updateRateBuckets = report.updateRateOverTime.map((p) => ({
-            tMs: p.tMs,
-            rate: p.ms,
-            n: p.n,
-          }));
-        }
+        // Prefer full-run series from report (do NOT overwrite with observe-only)
+        applyReportSeriesToSummary(summary, report);
+        if (full?.report) applyReportSeriesToSummary(summary, full.report);
         runs.set(id, {
           id,
           label: summary.label,
