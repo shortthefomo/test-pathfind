@@ -13,8 +13,9 @@
  *   3. Hold at cap for observeMs
  *   4. Ramp down: close one path_find every addIntervalMs until none remain
  *
- * Final report includes create latencies, time-series of update gaps, and
- * individual session drill-down.
+ * Final report includes create latencies, time-series of update gaps,
+ * individual session drill-down, and consensus health from server_info +
+ * get_counts (server_state FULL/SYNCING/CONNECTED transitions over the run).
  */
 
 import fs from "node:fs/promises";
@@ -32,6 +33,11 @@ import {
 } from "./pathfind-session.js";
 import { summarizeNumbers, fmtStats, fmtMs } from "./metrics.js";
 import { sleep, shuffle } from "./xrpl.js";
+import {
+  ServerMonitor,
+  summarizeConsensus,
+  isHealthyServerState,
+} from "./server-monitor.js";
 import {
   renderRampLineChart,
   renderTimeSeriesChart,
@@ -387,6 +393,7 @@ function printObserveDashboard({
   observeStartT,
   observeMs,
   runStartedAt,
+  consensus = null,
 }) {
   const open = countOpenWorkers(workers);
   const ready = countReadyWorkers(workers);
@@ -399,6 +406,31 @@ function printObserveDashboard({
     ` OBSERVE  open=${open}/${maxConcurrency}  updating=${ready}  failed=${fail}  ` +
       `elapsed=${fmtMs(elapsedObserve)}  remain=${fmtMs(remain)}  events=${timeline.length}`
   );
+  if (consensus?.latest) {
+    const L = consensus.latest;
+    const st = L.server_state || "?";
+    const flag = L.healthy ? "OK" : "DEGRADED";
+    console.log(
+      ` CONSENSUS  state=${String(st).toUpperCase()} (${flag})` +
+        (L.validatedSeq != null ? `  ledger=${L.validatedSeq}` : "") +
+        (L.ledgerAge != null ? ` age=${L.ledgerAge}s` : "") +
+        (L.loadFactor != null ? `  load=${L.loadFactor}` : "") +
+        (L.peers != null ? `  peers=${L.peers}` : "") +
+        (L.convergeTimeS != null ? `  converge=${L.convergeTimeS}s` : "") +
+        (L.proposers != null ? ` proposers=${L.proposers}` : "") +
+        (L.txInMemory != null ? `  tx_mem=${L.txInMemory}` : "") +
+        (L.PathRequest != null ? `  PathRequest=${L.PathRequest}` : "") +
+        (L.STPath != null ? `  STPath=${L.STPath}` : "") +
+        (L.STPathElement != null ? `  STPathElement=${L.STPathElement}` : "") +
+        (L.STPathSet != null ? `  STPathSet=${L.STPathSet}` : "") +
+        (L.PathFindTrustLine != null
+          ? `  PathFindTrustLine=${L.PathFindTrustLine}`
+          : "") +
+        (consensus.stateChanges?.length
+          ? `  state_changes=${consensus.stateChanges.length}`
+          : "")
+    );
+  }
 
   const gaps = updateGapOverTime(timeline, { sinceT: observeStartT });
   const bucketed = bucketTimeSeries(gaps, UPDATE_BUCKET_MS);
@@ -486,6 +518,7 @@ export function buildProgressSnapshot({
   message = null,
   mode = "burst",
   addIntervalMs = 0,
+  consensus = null,
 }) {
   const open = countOpenWorkers(workers);
   const ready = countReadyWorkers(workers);
@@ -543,6 +576,7 @@ export function buildProgressSnapshot({
     perSessionGaps,
     phases,
     message,
+    consensus,
   };
 }
 
@@ -579,6 +613,12 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
     report.requestPlan ||
     null;
   const planLen = Array.isArray(requestPlan) ? requestPlan.length : 0;
+
+  const consensus =
+    report.consensus ||
+    (run.serverMonitorSamples
+      ? summarizeConsensus(run.serverMonitorSamples)
+      : null);
 
   return {
     id: id || run.id || null,
@@ -624,7 +664,22 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
         count: gapStats.count,
       },
       updateRateMean: rateStats.mean,
+      consensus: consensus
+        ? {
+            broke: consensus.broke,
+            verdict: consensus.verdict,
+            firstState: consensus.firstState,
+            lastState: consensus.lastState,
+            statesSeen: consensus.statesSeen,
+            stateChangeCount: consensus.stateChanges?.length ?? 0,
+            ledgerAdvance: consensus.ledgerAdvance,
+            maxLoadFactor: consensus.maxLoadFactor,
+            getCountsAvailable: consensus.getCountsAvailable,
+            pathfindCounts: consensus.pathfindCounts || null,
+          }
+        : null,
     },
+    consensus,
     series: {
       // Full-run series (for observe-window shading on charts). Stats above
       // still use observe-window-only series from the report.
@@ -652,6 +707,26 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
       perSessionGaps:
         report.perSessionGapsFull ||
         report.perSessionGaps || { tMs: [], sessions: [] },
+      serverState: (consensus?.series || []).map((p) => ({
+        tMs: p.tMs,
+        state: p.server_state,
+        rank: p.stateRank,
+        healthy: p.healthy,
+        validatedSeq: p.validatedSeq,
+        ledgerAge: p.ledgerAge,
+        loadFactor: p.loadFactor,
+        peers: p.peers,
+        convergeTimeS: p.convergeTimeS,
+        proposers: p.proposers,
+        txInMemory: p.txInMemory,
+        writeLoad: p.writeLoad,
+        PathFindTrustLine: p.PathFindTrustLine ?? null,
+        PathRequest: p.PathRequest ?? null,
+        STPath: p.STPath ?? null,
+        STPathElement: p.STPathElement ?? null,
+        STPathSet: p.STPathSet ?? null,
+        pathfind: p.pathfind || null,
+      })),
     },
   };
 }
@@ -782,11 +857,56 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     requestPlan: [],
     replayOf: opts.replayOf || null,
     isReplay,
+    /** Filled by ServerMonitor (getter) + summarizeConsensus at end */
+    consensus: null,
   };
 
   const getOpenCount = () => countOpenWorkers(workers);
 
-  const emitProgress = (phase, message = null, force = false) => {
+  // Dedicated WS that polls server_info + get_counts for consensus health
+  const monitorIntervalMs = Math.max(
+    500,
+    Number(cfg.serverMonitorIntervalMs ?? 2_000) || 2_000
+  );
+  /** @type {(phase: string, message?: string|null, force?: boolean) => void} */
+  let emitProgress = () => {};
+  const serverMonitor = new ServerMonitor({
+    endpoint: cfg.endpoint,
+    intervalMs: monitorIntervalMs,
+    getElapsedMs: () => Date.now() - runStartedAt,
+    getPhase: () => currentPhase,
+    onWarn: (msg) => warn(`[loadtest] ${msg}`),
+    onSample: (sample) => {
+      // Detect state changes against previous successful sample
+      if (!sample.server_info?.server_state) return;
+      const prev = [...serverMonitor.samples]
+        .reverse()
+        .find((s) => s !== sample && s.server_info?.server_state);
+      const prevState = prev?.server_info?.server_state;
+      if (
+        prevState &&
+        String(prevState).toLowerCase() !==
+          String(sample.server_info.server_state).toLowerCase()
+      ) {
+        const healthy = isHealthyServerState(sample.server_info.server_state);
+        warn(
+          `[loadtest] server_state ${prevState} → ${sample.server_info.server_state}` +
+            ` @ ${fmtMs(sample.tMs)}` +
+            (healthy ? "" : " ⚠ CONSENSUS DEGRADED")
+        );
+        emitProgress(
+          currentPhase,
+          `server_state ${prevState} → ${sample.server_info.server_state}`,
+          true
+        );
+      }
+    },
+  });
+  log(
+    `[loadtest] consensus monitor: server_info + get_counts every ${fmtMs(monitorIntervalMs)}`
+  );
+
+  emitProgress = (phase, message = null, force = false) => {
     if (!onProgress) return;
     const now = Date.now();
     // Throttle chatty phases; always allow phase transitions (force)
@@ -815,12 +935,52 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
           message,
           mode,
           addIntervalMs,
+          consensus: serverMonitor.progressView(),
         })
       );
     } catch (err) {
       console.warn("[loadtest] onProgress error:", err.message);
     }
   };
+
+  await serverMonitor.start();
+  {
+    const first = serverMonitor.latest;
+    if (first?.server_info?.server_state) {
+      log(
+        `[loadtest] server_state=${first.server_info.server_state}` +
+          (first.server_info.validated_ledger?.seq != null
+            ? ` validated_ledger=${first.server_info.validated_ledger.seq}`
+            : "") +
+          (first.server_info.peers != null
+            ? ` peers=${first.server_info.peers}`
+            : "") +
+          (first.get_counts
+            ? " (get_counts ok)"
+            : " (get_counts n/a — admin?)")
+      );
+      if (!isHealthyServerState(first.server_info.server_state)) {
+        warn(
+          `[loadtest] server is not FULL/PROPOSING at start ` +
+            `(${first.server_info.server_state}) — consensus may already be degraded`
+        );
+      }
+    } else if (first?.error) {
+      warn(`[loadtest] consensus monitor first sample failed: ${first.error}`);
+    }
+  }
+
+  try {
+    return await runLoadTestBody();
+  } finally {
+    try {
+      await serverMonitor.stop();
+    } catch (err) {
+      warn(`[loadtest] server monitor stop: ${err.message}`);
+    }
+  }
+
+  async function runLoadTestBody() {
 
   const setPhase = (phase, message = null) => {
     currentPhase = phase;
@@ -1062,6 +1222,7 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
             observeStartT,
             observeMs,
             runStartedAt,
+            consensus: serverMonitor.progressView(),
           });
         }
         emitProgress("observe", null, true);
@@ -1077,6 +1238,7 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
         observeStartT,
         observeMs,
         runStartedAt,
+        consensus: serverMonitor.progressView(),
       });
     }
     emitProgress(
@@ -1145,6 +1307,13 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     await Promise.all(workers.map((w) => w.stop()));
   }
 
+  // Final consensus sample before building the report
+  try {
+    await serverMonitor.stop();
+  } catch (err) {
+    warn(`[loadtest] server monitor stop: ${err.message}`);
+  }
+
   run.endedAt = new Date().toISOString();
   run.timeline = timeline;
   run.sessions = workers.map((w) => ({ ...w.state }));
@@ -1156,6 +1325,9 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
       : buildRequestPlanFromSessions(run.sessions);
   run.observeStartT = observeStartT;
   run.buckets = bucketByConcurrency(timeline, maxConcurrency);
+  // Snapshot samples for JSON persistence
+  run.serverMonitorSamples = serverMonitor.samples.slice();
+  run.consensus = summarizeConsensus(run.serverMonitorSamples);
   run.report = buildReport(run);
 
   if (!quiet) {
@@ -1177,6 +1349,7 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   }
 
   return run;
+  } // end runLoadTestBody
 }
 
 function buildReport(run) {
@@ -1205,6 +1378,12 @@ function buildReport(run) {
     sinceT: 0,
     bucketMs: UPDATE_BUCKET_MS,
   });
+  const consensus =
+    run.consensus ||
+    (run.serverMonitorSamples
+      ? summarizeConsensus(run.serverMonitorSamples)
+      : null);
+
   return {
     endpoint: run.endpoint,
     mode: run.mode || "burst",
@@ -1231,6 +1410,8 @@ function buildReport(run) {
     requestPlan: run.requestPlan || [],
     replayOf: run.replayOf || null,
     isReplay: Boolean(run.isReplay),
+    /** Consensus / server health over the run (server_info + get_counts) */
+    consensus,
   };
 }
 
@@ -1409,6 +1590,141 @@ function printFinalReport(run) {
       `failed=${run.sessions.filter((s) => s.failed).length}  ` +
       `total=${run.sessions.length}`
   );
+
+  printConsensusReport(run.consensus || run.report?.consensus);
+}
+
+/**
+ * Print consensus / server_state health from server_info + get_counts samples.
+ */
+function printConsensusReport(consensus) {
+  console.log("\n── consensus / server health (server_info + get_counts) ──");
+  if (!consensus || !consensus.available) {
+    console.log(
+      `  ${consensus?.verdict || "no samples — could not poll server_info"}`
+    );
+    if (consensus?.errorCount) {
+      console.log(`  monitor errors: ${consensus.errorCount}`);
+    }
+    return;
+  }
+
+  const tag = consensus.broke ? "✗ DEGRADED" : "✓ OK";
+  console.log(`  verdict: ${tag}`);
+  console.log(`  ${consensus.verdict}`);
+  console.log(
+    `  states: ${consensus.firstState || "?"} → ${consensus.lastState || "?"}` +
+      `  seen=[${(consensus.statesSeen || []).join(", ")}]` +
+      `  samples=${consensus.okSamples ?? consensus.sampled}`
+  );
+  if (consensus.stateChanges?.length) {
+    console.log(`  state changes (${consensus.stateChanges.length}):`);
+    for (const c of consensus.stateChanges.slice(0, 40)) {
+      console.log(
+        `    @ ${fmtMs(c.tMs)}  ${c.from} → ${c.to}` +
+          (c.phase ? `  (${c.phase})` : "")
+      );
+    }
+    if (consensus.stateChanges.length > 40) {
+      console.log(`    … +${consensus.stateChanges.length - 40} more`);
+    }
+  } else {
+    console.log("  state changes: none (stable)");
+  }
+
+  if (consensus.ledgerAdvance != null) {
+    console.log(
+      `  validated ledger: ${consensus.minValidatedSeq} → ${consensus.maxValidatedSeq}` +
+        `  (advanced ${consensus.ledgerAdvance})` +
+        (consensus.maxLedgerAge != null
+          ? `  max age=${consensus.maxLedgerAge}s`
+          : "")
+    );
+  }
+  if (consensus.maxLoadFactor != null || consensus.maxIoLatencyMs != null) {
+    console.log(
+      `  load_factor max=${consensus.maxLoadFactor ?? "n/a"}` +
+        `  io_latency max=${consensus.maxIoLatencyMs != null ? consensus.maxIoLatencyMs + "ms" : "n/a"}` +
+        (consensus.maxConvergeTimeS != null
+          ? `  converge max=${consensus.maxConvergeTimeS}s`
+          : "") +
+        (consensus.minProposers != null
+          ? `  proposers ${consensus.minProposers}–${consensus.maxProposers}`
+          : "")
+    );
+  }
+
+  const deltas = consensus.accountingDeltas || {};
+  const deltaKeys = Object.keys(deltas);
+  if (deltaKeys.length) {
+    console.log(
+      "  state_accounting transitions during run: " +
+        deltaKeys.map((k) => `${k}+${deltas[k]}`).join(", ")
+    );
+  } else {
+    console.log("  state_accounting transitions during run: none");
+  }
+
+  if (consensus.getCountsAvailable) {
+    const first = consensus.first?.get_counts;
+    const last = consensus.last?.get_counts;
+    console.log(
+      `  get_counts: ${consensus.getCountsSamples} samples` +
+        (first && last
+          ? `  Transaction ${first.Transaction ?? "?"}→${last.Transaction ?? "?"}` +
+            `  NodeObject ${first.NodeObject ?? "?"}→${last.NodeObject ?? "?"}` +
+            (last.write_load != null ? `  write_load=${last.write_load}` : "")
+          : "")
+    );
+    // Pathfinding in-memory object counts (xrpl::PathRequest, STPath, …)
+    const pf = consensus.pathfindCounts;
+    if (pf) {
+      console.log("  pathfind object counts (get_counts):");
+      for (const key of [
+        "PathFindTrustLine",
+        "PathRequest",
+        "STPath",
+        "STPathElement",
+        "STPathSet",
+      ]) {
+        const row = pf[key];
+        if (!row) continue;
+        const any =
+          row.first != null ||
+          row.last != null ||
+          row.max != null;
+        if (!any) {
+          console.log(`    ${key}: (not reported)`);
+          continue;
+        }
+        console.log(
+          `    ${key}: ${row.first ?? "?"} → ${row.last ?? "?"}` +
+            (row.max != null ? `  peak=${row.max}` : "") +
+            (row.delta != null
+              ? `  Δ=${row.delta >= 0 ? "+" : ""}${row.delta}`
+              : "")
+        );
+      }
+    }
+  } else {
+    console.log(
+      "  get_counts: unavailable (endpoint may not expose admin RPC)"
+    );
+  }
+
+  // Compact state sparkline via ranks
+  const ranks = (consensus.series || [])
+    .map((p) => p.stateRank)
+    .filter((r) => r != null);
+  if (ranks.length > 1) {
+    // Map rank 0–5 onto sparkline heights
+    console.log(
+      `  state rank sparkline (0=disconnected … 4=full 5=proposing): ${sparkline(
+        ranks.map((r) => r * 100),
+        56
+      )}`
+    );
+  }
 }
 
 /**

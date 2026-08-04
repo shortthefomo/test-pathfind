@@ -122,7 +122,85 @@ const observeWindowPlugin = {
   },
 };
 
+/**
+ * Draw vertical markers at run-relative times (e.g. every 10 path_find opens).
+ * Config: { pointTMs, markers: [{ tMs, label? }], color?, labelColor? }
+ */
+const timeMarkersPlugin = {
+  id: "timeMarkers",
+  afterDatasetsDraw(chart) {
+    const cfg = chart.options.plugins?.timeMarkers;
+    if (!cfg?.markers?.length || !cfg.pointTMs?.length) return;
+
+    const pointTMs = cfg.pointTMs;
+    const xScale = chart.scales.x;
+    const yScale = chart.scales.y;
+    if (!xScale || !yScale) return;
+
+    const tToIndex = (t) => {
+      if (t <= pointTMs[0]) return 0;
+      if (t >= pointTMs[pointTMs.length - 1]) return pointTMs.length - 1;
+      for (let i = 0; i < pointTMs.length - 1; i++) {
+        const a = pointTMs[i];
+        const b = pointTMs[i + 1];
+        if (t >= a && t <= b) {
+          if (b === a) return i;
+          return i + (t - a) / (b - a);
+        }
+      }
+      return pointTMs.length - 1;
+    };
+
+    const ctx = chart.ctx;
+    const top = yScale.top;
+    const bottom = yScale.bottom;
+    const color = cfg.color || "rgba(56, 189, 248, 0.75)";
+    const labelColor = cfg.labelColor || "#7dd3fc";
+    const dash = cfg.borderDash || [3, 3];
+
+    ctx.save();
+    for (const m of cfg.markers) {
+      if (m?.tMs == null || !Number.isFinite(m.tMs)) continue;
+      // Skip markers completely outside the plotted time range (with small pad)
+      const minT = pointTMs[0];
+      const maxT = pointTMs[pointTMs.length - 1];
+      if (m.tMs < minT - 1 || m.tMs > maxT + 1) continue;
+
+      const x = xScale.getPixelForValue(tToIndex(m.tMs));
+      if (!Number.isFinite(x)) continue;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash(dash);
+      ctx.beginPath();
+      ctx.moveTo(x, top);
+      ctx.lineTo(x, bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const label = m.label != null ? String(m.label) : "";
+      if (label) {
+        ctx.font = "600 10px system-ui, sans-serif";
+        ctx.fillStyle = labelColor;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        const textW = ctx.measureText(label).width;
+        const pillW = textW + 8;
+        const pillH = 14;
+        const px = x;
+        const py = top + 4;
+        ctx.fillStyle = "rgba(15, 23, 42, 0.8)";
+        ctx.fillRect(px - pillW / 2, py, pillW, pillH);
+        ctx.fillStyle = labelColor;
+        ctx.fillText(label, px, py + 2);
+      }
+    }
+    ctx.restore();
+  },
+};
+
 Chart.register(observeWindowPlugin);
+Chart.register(timeMarkersPlugin);
 
 const props = defineProps({
   title: { type: String, default: "" },
@@ -144,6 +222,11 @@ const props = defineProps({
    * @type {{ startMs: number, endMs: number, label?: string } | null}
    */
   observeWindow: { type: Object, default: null },
+  /**
+   * Vertical markers at run-relative times (e.g. every 10 path_find opens).
+   * @type {Array<{ tMs: number, label?: string, n?: number }>}
+   */
+  timeMarkers: { type: Array, default: () => [] },
 });
 
 const canvas = ref(null);
@@ -242,6 +325,16 @@ function build() {
               labelColor: "#c4b5fd",
             }
           : null,
+        timeMarkers:
+          props.timeMarkers?.length && props.pointTMs?.length
+            ? {
+                pointTMs: props.pointTMs,
+                markers: props.timeMarkers,
+                color: "rgba(56, 189, 248, 0.7)",
+                labelColor: "#7dd3fc",
+                borderDash: [3, 3],
+              }
+            : null,
       },
       scales: {
         x: {
@@ -286,6 +379,7 @@ watch(
     props.showLegend,
     props.pointTMs,
     props.observeWindow,
+    props.timeMarkers,
   ],
   () => build(),
   { deep: true }

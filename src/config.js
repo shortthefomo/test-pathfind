@@ -46,6 +46,12 @@ export const DEFAULTS = {
   /** How often to refresh the live time-series dashboard during observe */
   dashboardIntervalMs: 10_000,
 
+  /**
+   * How often to poll server_info + get_counts for consensus health during a
+   * run. State changes (FULL / SYNCING / CONNECTED / …) are the main signal.
+   */
+  serverMonitorIntervalMs: 2_000,
+
   /** @deprecated alias of observeMs for older flags */
   holdAtPeakMs: 30_000,
 

@@ -92,8 +92,27 @@ data/wallets.json # Wallet cache
 data/results/     # Run outputs + UI index
 ```
 
+## Consensus health
+
+Every run opens a **dedicated WebSocket** that polls:
+
+| RPC | Role |
+|-----|------|
+| `server_info` | `server_state` (FULL / SYNCING / CONNECTED / TRACKING / PROPOSING), ledger seq/age, load_factor, last_close converge time & proposers, state_accounting |
+| `get_counts` | Admin object/memory counters — especially pathfind types (`xrpl::PathRequest`, `PathFindTrustLine`, `STPath`, `STPathElement`, `STPathSet`) plus Transaction/NodeObject/write_load. Skipped cleanly if the endpoint is not admin |
+
+The report includes:
+
+- **Verdict**: consensus OK (stayed FULL/PROPOSING) vs **degraded** (saw SYNCING/CONNECTED/etc.)
+- **State changes** with timestamps and phase
+- Time-series for charts (state rank, load_factor)
+- Ledger advance and state_accounting transition deltas over the run
+
+CLI final report prints a `── consensus / server health ──` section; the Vue UI shows live `server_state` stats and charts, plus a **Consensus** column in history.
+
 ## Notes
 
 - Max concurrency is capped at **1000** in the API/UI.
 - Loads above ~200 sockets can hit OS fd limits or node capacity — the form warns above 200.
 - Path quality under load is not guaranteed; empty `alternatives` is a useful stress signal.
+- `get_counts` requires admin access on the rippled port; without it, consensus verdict still works from `server_info` alone.

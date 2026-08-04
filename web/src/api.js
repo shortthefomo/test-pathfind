@@ -131,6 +131,34 @@ export function buildPerSessionOverlay(perSession) {
 }
 
 /**
+ * Vertical markers for every N path_find creates (opens), placed at the
+ * create-completion time of the Nth, 2Nth, … session.
+ *
+ * @param {Array<{ tMs?: number|null }>|null|undefined} createSeries
+ * @param {number} [everyN=10]
+ * @returns {Array<{ tMs: number, n: number, label: string }>}
+ */
+export function buildPathFindOpenMarkers(createSeries, everyN = 10) {
+  const step = Math.max(1, Number(everyN) || 10);
+  const pts = (createSeries || [])
+    .filter((p) => p && p.tMs != null && Number.isFinite(p.tMs))
+    .slice()
+    .sort((a, b) => a.tMs - b.tMs);
+  if (!pts.length) return [];
+
+  const markers = [];
+  for (let i = step - 1; i < pts.length; i += step) {
+    const n = i + 1; // 10, 20, 30, …
+    markers.push({
+      tMs: pts[i].tMs,
+      n,
+      label: String(n),
+    });
+  }
+  return markers;
+}
+
+/**
  * Build observe-window descriptor for LineChart from progress/summary.
  * @returns {{ startMs: number, endMs: number, label: string } | null}
  */
@@ -189,6 +217,84 @@ export function padSeriesForObserveWindow(series, observeWindow) {
     labels = [...labels, fmt(endMs)];
     pointTMs = [...pointTMs, endMs];
     data = [...data, null];
+  }
+
+  return { labels, pointTMs, data };
+}
+
+/**
+ * Extend a series' time axis so vertical markers (e.g. every +10 path_finds)
+ * fall inside the plotted range. Pads with null y-values at marker times.
+ *
+ * @param {{ labels: string[], pointTMs: number[], data: (number|null)[] }} series
+ * @param {Array<{ tMs: number }>|null|undefined} markers
+ */
+export function padSeriesForTimeMarkers(series, markers) {
+  if (!markers?.length) return series;
+  const fmt = (t) => (t / 1000).toFixed(t % 1000 === 0 ? 0 : 1) + "s";
+
+  let labels = [...(series.labels || [])];
+  let pointTMs = [...(series.pointTMs || [])];
+  let data = [...(series.data || [])];
+
+  const times = markers
+    .map((m) => m?.tMs)
+    .filter((t) => t != null && Number.isFinite(t))
+    .sort((a, b) => a - b);
+  if (!times.length) return series;
+
+  if (!pointTMs.length) {
+    return {
+      labels: times.map(fmt),
+      pointTMs: times,
+      data: times.map(() => null),
+    };
+  }
+
+  // Prepend markers / times before first point
+  const pre = [];
+  for (const t of times) {
+    if (t < pointTMs[0]) pre.push(t);
+  }
+  // unique-ish sorted pre
+  const preUnique = [...new Set(pre)].sort((a, b) => a - b);
+  if (preUnique.length) {
+    labels = [...preUnique.map(fmt), ...labels];
+    pointTMs = [...preUnique, ...pointTMs];
+    data = [...preUnique.map(() => null), ...data];
+  }
+
+  // Append markers after last point
+  const post = [];
+  for (const t of times) {
+    if (t > pointTMs[pointTMs.length - 1]) post.push(t);
+  }
+  const postUnique = [...new Set(post)].sort((a, b) => a - b);
+  if (postUnique.length) {
+    labels = [...labels, ...postUnique.map(fmt)];
+    pointTMs = [...pointTMs, ...postUnique];
+    data = [...data, ...postUnique.map(() => null)];
+  }
+
+  // Insert interior marker times that fall between existing buckets (for
+  // accurate vertical placement when gaps are sparse)
+  for (const t of times) {
+    // binary-ish scan: skip if already very close to an existing point
+    let exists = false;
+    for (let i = 0; i < pointTMs.length; i++) {
+      if (Math.abs(pointTMs[i] - t) < 1) {
+        exists = true;
+        break;
+      }
+    }
+    if (exists) continue;
+    // find insert index
+    let idx = pointTMs.findIndex((p) => p > t);
+    if (idx < 0) continue; // would be post — already handled
+    if (idx === 0) continue; // would be pre — already handled
+    labels.splice(idx, 0, fmt(t));
+    pointTMs.splice(idx, 0, t);
+    data.splice(idx, 0, null);
   }
 
   return { labels, pointTMs, data };

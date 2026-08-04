@@ -32,6 +32,16 @@ function canRerun(r) {
   return Boolean(r.resultsPath || r.summary);
 }
 
+/** Consensus summary from UI summary (or nested stats). */
+function consensusOf(r) {
+  return (
+    r?.summary?.consensus ||
+    r?.summary?.stats?.consensus ||
+    r?.consensus ||
+    null
+  );
+}
+
 /** Full WebSocket URL for a run (config → summary → empty). */
 function runEndpoint(r) {
   return (
@@ -161,6 +171,7 @@ function confirmRerun() {
             <th>Create p95</th>
             <th>Upd gap p50</th>
             <th>Success</th>
+            <th>Consensus</th>
             <th>When</th>
             <th></th>
           </tr>
@@ -219,6 +230,22 @@ function confirmRerun() {
             <td>{{ fmtMs(r.summary?.stats?.create?.p95) }}</td>
             <td>{{ fmtMs(r.summary?.stats?.updateGap?.p50) }}</td>
             <td>{{ fmtPct(r.summary?.stats?.successRate) }}</td>
+            <td>
+              <template v-if="consensusOf(r)">
+                <span
+                  class="status-tag"
+                  :class="consensusOf(r).broke ? 'error' : 'done'"
+                  :title="consensusOf(r).verdict || ''"
+                >
+                  {{
+                    consensusOf(r).broke
+                      ? "degraded"
+                      : (consensusOf(r).lastState || "ok").toUpperCase()
+                  }}
+                </span>
+              </template>
+              <span v-else class="muted">—</span>
+            </td>
             <td class="muted mono">
               {{ r.startedAt ? new Date(r.startedAt).toLocaleString() : "—" }}
             </td>

@@ -432,6 +432,39 @@ tbody tr.rerun-source {
   font-size: 0.9rem;
 }
 
+.msg.done,
+.consensus-verdict.done {
+  color: var(--ok);
+}
+
+.msg.err,
+.consensus-verdict.err {
+  color: var(--danger);
+}
+
+.consensus-detail {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #0b1220;
+}
+
+.consensus-detail .msg {
+  margin-bottom: 6px;
+}
+
+.state-change-list {
+  margin: 8px 0 0;
+  padding-left: 1.2rem;
+  font-size: 0.85rem;
+  font-family: var(--mono);
+}
+
+.state-change-list li {
+  margin: 2px 0;
+}
+
 .charts {
   display: grid;
   grid-template-columns: 1fr;

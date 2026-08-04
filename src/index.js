@@ -61,6 +61,10 @@ Options:
   --discoverOnly              Only discover wallets, then exit
   --replay=PATH               Rerun: same path_find requests in same order from a prior results JSON
   --inspect                   After run, interactive drill-down of individual sessions
+
+  Each run also polls server_info + get_counts to report whether consensus
+  stayed healthy (FULL/PROPOSING) or degraded (SYNCING/CONNECTED/…).
+
   --help
 
 Examples:

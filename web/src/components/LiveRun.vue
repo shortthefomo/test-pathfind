@@ -6,6 +6,8 @@ import {
   buildPerSessionOverlay,
   buildObserveWindow,
   padSeriesForObserveWindow,
+  buildPathFindOpenMarkers,
+  padSeriesForTimeMarkers,
 } from "../api.js";
 
 const props = defineProps({
@@ -110,9 +112,14 @@ const overlayChart = computed(() => {
   };
 });
 
+/** Vertical markers at every 10th path_find create (open). */
+const pathFindOpenMarkers = computed(() =>
+  buildPathFindOpenMarkers(props.progress?.createLatencies || [], 10)
+);
+
 const gapChart = computed(() => {
   const pts = props.progress?.updateGapBuckets || [];
-  const padded = padSeriesForObserveWindow(
+  let padded = padSeriesForObserveWindow(
     {
       labels: pts.map((p) => (p.tMs / 1000).toFixed(0) + "s"),
       pointTMs: pts.map((p) => p.tMs),
@@ -120,6 +127,8 @@ const gapChart = computed(() => {
     },
     observeWindow.value
   );
+  // Keep +10 / +20 / … open markers on-axis even during ramp-up
+  padded = padSeriesForTimeMarkers(padded, pathFindOpenMarkers.value);
   return {
     labels: padded.labels,
     pointTMs: padded.pointTMs,
@@ -169,6 +178,132 @@ const observeLegend = computed(() => {
   if (!w) return null;
   return `${(w.startMs / 1000).toFixed(0)}s → ${(w.endMs / 1000).toFixed(0)}s`;
 });
+
+const consensus = computed(() => props.progress?.consensus || null);
+const consensusLatest = computed(() => consensus.value?.latest || null);
+const consensusClass = computed(() => {
+  const c = consensus.value;
+  if (!c?.available) return "muted";
+  if (c.broke) return "err";
+  return "done";
+});
+
+const stateChart = computed(() => {
+  const pts = consensus.value?.series || [];
+  if (!pts.length) return null;
+  const padded = padSeriesForObserveWindow(
+    {
+      labels: pts.map((p) => (p.tMs / 1000).toFixed(0) + "s"),
+      pointTMs: pts.map((p) => p.tMs),
+      data: pts.map((p) => p.stateRank),
+    },
+    observeWindow.value
+  );
+  return {
+    labels: padded.labels,
+    pointTMs: padded.pointTMs,
+    datasets: [
+      {
+        label: "server_state rank",
+        data: padded.data,
+        borderColor: "#34d399",
+        backgroundColor: "rgba(52,211,153,0.12)",
+        fill: true,
+        pointRadius: 2,
+        spanGaps: true,
+        stepped: true,
+      },
+    ],
+  };
+});
+
+const loadChart = computed(() => {
+  const pts = consensus.value?.series || [];
+  if (!pts.length) return null;
+  const hasLoad = pts.some((p) => p.loadFactor != null);
+  if (!hasLoad) return null;
+  const padded = padSeriesForObserveWindow(
+    {
+      labels: pts.map((p) => (p.tMs / 1000).toFixed(0) + "s"),
+      pointTMs: pts.map((p) => p.tMs),
+      data: pts.map((p) => p.loadFactor),
+    },
+    observeWindow.value
+  );
+  return {
+    labels: padded.labels,
+    pointTMs: padded.pointTMs,
+    datasets: [
+      {
+        label: "load_factor",
+        data: padded.data,
+        borderColor: "#f472b6",
+        backgroundColor: "rgba(244,114,182,0.1)",
+        fill: true,
+        pointRadius: 1,
+        spanGaps: true,
+      },
+    ],
+  };
+});
+
+const PATHFIND_KEYS = [
+  { key: "PathRequest", color: "#38bdf8" },
+  { key: "PathFindTrustLine", color: "#fbbf24" },
+  { key: "STPath", color: "#a78bfa" },
+  { key: "STPathElement", color: "#34d399" },
+  { key: "STPathSet", color: "#f472b6" },
+];
+
+const pathfindChart = computed(() => {
+  const pts = consensus.value?.series || [];
+  if (!pts.length) return null;
+  const hasAny = PATHFIND_KEYS.some((k) =>
+    pts.some((p) => p[k.key] != null || p.pathfind?.[k.key] != null)
+  );
+  if (!hasAny) return null;
+
+  const labels = pts.map((p) => (p.tMs / 1000).toFixed(0) + "s");
+  const pointTMs = pts.map((p) => p.tMs);
+  // Pad axis once using first series
+  const padBase = padSeriesForObserveWindow(
+    {
+      labels,
+      pointTMs,
+      data: pts.map(
+        (p) => p.PathRequest ?? p.pathfind?.PathRequest ?? null
+      ),
+    },
+    observeWindow.value
+  );
+  const pre =
+    padBase.pointTMs.length > pointTMs.length &&
+    padBase.pointTMs[0] < pointTMs[0]
+      ? 1
+      : 0;
+  const extra = padBase.pointTMs.length - pointTMs.length;
+
+  const datasets = PATHFIND_KEYS.map(({ key, color }) => {
+    let data = pts.map((p) => p[key] ?? p.pathfind?.[key] ?? null);
+    if (pre) data = [null, ...data];
+    for (let i = 0; i < extra - pre; i++) data.push(null);
+    return {
+      label: key,
+      data,
+      borderColor: color,
+      backgroundColor: "transparent",
+      pointRadius: 1,
+      spanGaps: true,
+      borderWidth: 1.5,
+    };
+  });
+
+  return {
+    labels: padBase.labels,
+    pointTMs: padBase.pointTMs,
+    datasets,
+  };
+});
 </script>
 
 <template>
@@ -216,8 +351,60 @@ const observeLegend = computed(() => {
           <span class="stat-label">Observe left</span>
           <span class="stat-val">{{ fmtMs(progress.observeRemainMs) }}</span>
         </div>
+        <div class="stat" v-if="consensusLatest">
+          <span class="stat-label">server_state</span>
+          <span class="stat-val" :class="consensusLatest.healthy ? '' : 'danger'">
+            {{ (consensusLatest.server_state || "?").toUpperCase() }}
+          </span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.validatedSeq != null">
+          <span class="stat-label">Ledger</span>
+          <span class="stat-val">
+            {{ consensusLatest.validatedSeq }}
+            <small v-if="consensusLatest.ledgerAge != null"
+              >age {{ consensusLatest.ledgerAge }}s</small
+            >
+          </span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.loadFactor != null">
+          <span class="stat-label">load_factor</span>
+          <span class="stat-val">{{ consensusLatest.loadFactor }}</span>
+        </div>
+        <div class="stat" v-if="consensus?.stateChanges?.length">
+          <span class="stat-label">State changes</span>
+          <span class="stat-val" :class="consensus.broke ? 'danger' : ''">
+            {{ consensus.stateChanges.length }}
+          </span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.PathRequest != null">
+          <span class="stat-label">PathRequest</span>
+          <span class="stat-val">{{ consensusLatest.PathRequest }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.STPath != null">
+          <span class="stat-label">STPath</span>
+          <span class="stat-val">{{ consensusLatest.STPath }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.STPathElement != null">
+          <span class="stat-label">STPathElement</span>
+          <span class="stat-val">{{ consensusLatest.STPathElement }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.STPathSet != null">
+          <span class="stat-label">STPathSet</span>
+          <span class="stat-val">{{ consensusLatest.STPathSet }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.PathFindTrustLine != null">
+          <span class="stat-label">PathFindTrustLine</span>
+          <span class="stat-val">{{ consensusLatest.PathFindTrustLine }}</span>
+        </div>
       </div>
       <p v-if="progress.message" class="msg">{{ progress.message }}</p>
+      <p
+        v-if="consensus?.verdict"
+        class="msg consensus-verdict"
+        :class="consensusClass"
+      >
+        {{ consensus.broke ? "⚠ " : "✓ " }}{{ consensus.verdict }}
+      </p>
 
       <div v-if="observeWindow" class="chart-legend-note">
         <span class="obs-swatch" />
@@ -256,13 +443,14 @@ const observeLegend = computed(() => {
           :height="220"
         />
         <LineChart
-          title="Mean update gap (all sessions)"
+          title="Mean update gap (all sessions) — markers every +10 path_finds"
           y-title="ms"
           x-title="run time"
           :labels="gapChart.labels"
           :datasets="gapChart.datasets"
           :point-t-ms="gapChart.pointTMs"
           :observe-window="observeWindow"
+          :time-markers="pathFindOpenMarkers"
           :height="220"
         />
         <LineChart
@@ -274,6 +462,39 @@ const observeLegend = computed(() => {
           :point-t-ms="rateChart.pointTMs"
           :observe-window="observeWindow"
           :height="200"
+        />
+        <LineChart
+          v-if="stateChart"
+          title="server_state over run (0=disconnected … 4=full 5=proposing)"
+          y-title="state rank"
+          x-title="run time"
+          :labels="stateChart.labels"
+          :datasets="stateChart.datasets"
+          :point-t-ms="stateChart.pointTMs"
+          :observe-window="observeWindow"
+          :height="180"
+        />
+        <LineChart
+          v-if="loadChart"
+          title="load_factor over run (server_info)"
+          y-title="load"
+          x-title="run time"
+          :labels="loadChart.labels"
+          :datasets="loadChart.datasets"
+          :point-t-ms="loadChart.pointTMs"
+          :observe-window="observeWindow"
+          :height="160"
+        />
+        <LineChart
+          v-if="pathfindChart"
+          title="Pathfind object counts (get_counts)"
+          y-title="in-memory"
+          x-title="run time"
+          :labels="pathfindChart.labels"
+          :datasets="pathfindChart.datasets"
+          :point-t-ms="pathfindChart.pointTMs"
+          :observe-window="observeWindow"
+          :height="220"
         />
       </div>
     </template>
