@@ -9,7 +9,7 @@ Load-tester for rippled/clio pathfinding, with a **Vue 3** dashboard for multi-r
 | **UI (dev)** | `npm run dev` | Express API + Vite Vue app at http://localhost:5173 |
 | **UI (prod)** | `npm run build && npm start` | Serves built `web/dist` |
 | **CLI** | `npm run cli -- --skipDiscover --max=50 --observeMin=2` | Terminal load test |
-| **Discover** | `npm run discover` | Cache high-trustline wallets |
+| **Discover** | `npm run discover -- [N]` | Cache wallets with ≥N funded trustlines (default N=200) |
 
 Default node: `ws://192.168.12.238:6006`
 
@@ -27,11 +27,16 @@ Default node: `ws://192.168.12.238:6006`
 3. **Hold / observe** — keep all open at the cap for the observe window
 4. **Ramp down** — close −1 path_find every **same** interval until none remain
 
-## Vue dashboard
+## Run the loadtest tool
+
+You need to cache the wallets used first via `npm run discover` that is written into data/wallets.json which you can manually edit as well (just reload it afterwards).
+
+Once that is done `npm run dev` and point your browser to **http://localhost:5173**
 
 ```bash
 npm install
-npm run discover          # once, if data/wallets.json is missing
+npm run discover          # once, if data/wallets.json is missing (default ≥200 trustlines)
+# npm run discover -- 50  # optional: lower threshold
 npm run dev
 ```
 

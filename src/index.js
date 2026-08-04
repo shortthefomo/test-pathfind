@@ -72,7 +72,8 @@ Examples:
   npm start -- --skipDiscover --max=10 --observeSec=30
   npm start -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeSec=60
   npm start -- --replay=data/results/loadtest-….json --observeSec=60
-  npm run discover -- --walletPoolSize=20
+  npm run discover -- 50
+  npm run discover -- 100 --walletPoolSize=20
 `);
 }
 

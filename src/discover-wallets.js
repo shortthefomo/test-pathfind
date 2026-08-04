@@ -491,11 +491,62 @@ export async function loadWallets(file) {
   return wallets;
 }
 
+/**
+ * Positional first number → minTrustlinesWithBalance.
+ * e.g. `npm run discover -- 50` or `node src/discover-wallets.js 50`
+ */
+function positionalMinTrustlines(argv = process.argv.slice(2)) {
+  for (const a of argv) {
+    if (a.startsWith("-")) continue;
+    const n = Number(a);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+function printDiscoverHelp() {
+  console.log(`Usage: npm run discover -- [N] [options]
+
+Discover wallets with many funded trustlines and cache them to walletsFile.
+
+Arguments:
+  N                           Minimum funded trustlines (default: ${DEFAULTS.minTrustlinesWithBalance})
+                              Same as --minTrustlinesWithBalance=N
+
+Options:
+  --minTrustlinesWithBalance=N  Funded trustline threshold (alias: --trustlines, --minTrustlines)
+  --walletPoolSize=N            How many wallets to collect (default: ${DEFAULTS.walletPoolSize})
+  --endpoint=URL                WebSocket URL (default: ${DEFAULTS.endpoint})
+  --walletsFile=PATH            Output cache path (default: ${DEFAULTS.walletsFile})
+  --maxCandidatesToScan=N       Cap on candidates inspected (default: ${DEFAULTS.maxCandidatesToScan})
+  --discoveryConcurrency=N      Parallel account checks (default: ${DEFAULTS.discoveryConcurrency})
+  --help
+
+Examples:
+  npm run discover
+  npm run discover -- 50
+  npm run discover -- 100 --walletPoolSize=30
+  npm run discover -- --minTrustlinesWithBalance=75 --walletPoolSize=20
+`);
+}
+
 async function main() {
   const args = parseArgs();
+  if (args.help || args.h) {
+    printDiscoverHelp();
+    return;
+  }
+
+  const minTrustlines =
+    args.minTrustlinesWithBalance ??
+    args.trustlines ??
+    args.minTrustlines ??
+    positionalMinTrustlines() ??
+    DEFAULTS.minTrustlinesWithBalance;
+
   const cfg = resolveConfig({
     endpoint: args.endpoint || DEFAULTS.endpoint,
-    minTrustlinesWithBalance: args.minTrustlinesWithBalance ?? DEFAULTS.minTrustlinesWithBalance,
+    minTrustlinesWithBalance: minTrustlines,
     walletPoolSize: args.walletPoolSize ?? args.wallets ?? DEFAULTS.walletPoolSize,
     maxCandidatesToScan: args.maxCandidatesToScan ?? DEFAULTS.maxCandidatesToScan,
     discoveryConcurrency: args.discoveryConcurrency ?? DEFAULTS.discoveryConcurrency,
