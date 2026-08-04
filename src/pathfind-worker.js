@@ -38,9 +38,17 @@ export async function startPathFindWorker({
   onEvent,
   selfPathFind = true,
   maxTokenAttempts = 3,
+  /** Pre-selected candidates (replay / deterministic plan). Skips random pick. */
+  candidates: fixedCandidates = null,
 }) {
   const tokenWallet = selfPathFind ? sourceWallet : destWallet;
-  const candidates = pickPathFindCandidates(tokenWallet, maxTokenAttempts);
+  const candidates =
+    Array.isArray(fixedCandidates) && fixedCandidates.length
+      ? fixedCandidates.map((c) => ({
+          destination_amount: c.destination_amount,
+          send_max: c.send_max,
+        }))
+      : pickPathFindCandidates(tokenWallet, maxTokenAttempts);
 
   const state = {
     sessionId,

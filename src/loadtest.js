@@ -24,6 +24,12 @@ import readline from "node:readline";
 import { DEFAULTS, parseArgs, resolveConfig } from "./config.js";
 import { loadWallets } from "./discover-wallets.js";
 import { startPathFindWorker } from "./pathfind-worker.js";
+import {
+  pickPathFindCandidates,
+  buildRequestPlanFromSessions,
+  normalizeRequestPlan,
+  compactCandidate,
+} from "./pathfind-session.js";
 import { summarizeNumbers, fmtStats, fmtMs } from "./metrics.js";
 import { sleep, shuffle } from "./xrpl.js";
 import {
@@ -568,6 +574,12 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
       ? observeStartT + observeMs
       : null;
 
+  const requestPlan =
+    run.requestPlan ||
+    report.requestPlan ||
+    null;
+  const planLen = Array.isArray(requestPlan) ? requestPlan.length : 0;
+
   return {
     id: id || run.id || null,
     label:
@@ -588,6 +600,11 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
     observeStartT,
     observeEndT,
     phases: run.phases || report.phases || {},
+    isReplay: Boolean(run.isReplay || report.isReplay),
+    replayOf: run.replayOf || report.replayOf || null,
+    /** true when this run can be re-executed with the same path_find sequence */
+    canRerun: planLen > 0 || (run.sessions?.length || 0) > 0,
+    requestPlanCount: planLen,
     stats: {
       opened,
       failed,
@@ -643,16 +660,33 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
  * Main load test. Burst closes all at once after observe; ramp ramps down
  * one session per addIntervalMs after the observe hold.
  *
+ * Pass `opts.requestPlan` (ordered path_find creates) to replay the same
+ * requests in the same order — used for repeatable re-tests.
+ *
  * @param {object} cfg
  * @param {object[]} wallets
- * @param {{ onProgress?: (snap: object) => void, quiet?: boolean }} [opts]
+ * @param {{
+ *   onProgress?: (snap: object) => void,
+ *   quiet?: boolean,
+ *   requestPlan?: object[],
+ *   replayOf?: string|null,
+ * }} [opts]
  */
 export async function runLoadTest(cfg, wallets, opts = {}) {
   const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
   const quiet = Boolean(opts.quiet ?? onProgress);
+  const replayPlan = normalizeRequestPlan(opts.requestPlan);
+  const isReplay = replayPlan.length > 0;
   const maxConcurrency = Math.min(
     1000,
-    Math.max(1, Number(cfg.maxConcurrency ?? cfg.cutoff ?? 50) || 50)
+    Math.max(
+      1,
+      Number(
+        isReplay
+          ? replayPlan.length
+          : cfg.maxConcurrency ?? cfg.cutoff ?? 50
+      ) || 50
+    )
   );
   const mode =
     String(cfg.mode || "burst").toLowerCase() === "ramp" ? "ramp" : "burst";
@@ -676,6 +710,12 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     else console.warn(...args);
   };
 
+  if (isReplay) {
+    log(
+      `[loadtest] REPLAY: ${maxConcurrency} path_find requests in fixed order` +
+        (opts.replayOf ? ` (from ${opts.replayOf})` : "")
+    );
+  }
   if (mode === "ramp") {
     log(
       `[loadtest] mode: ramp_up → ready → hold(observe) → ramp_down` +
@@ -696,15 +736,18 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   log(
     `[loadtest] ready timeout ${fmtMs(readyTimeoutMs)}  observe ${fmtMs(observeMs)}`
   );
-  log(`[loadtest] wallet pool: ${wallets.length}`);
-  log(
-    "[loadtest] accounts:",
-    wallets.map((w) => w.account).join(", ")
-  );
+  if (!isReplay) {
+    log(`[loadtest] wallet pool: ${wallets.length}`);
+    log(
+      "[loadtest] accounts:",
+      wallets.map((w) => w.account).join(", ")
+    );
+    if (!wallets.length) throw new Error("No wallets available for load test");
+  } else {
+    log(`[loadtest] request plan: ${replayPlan.length} sessions (wallets ignored)`);
+  }
 
-  if (!wallets.length) throw new Error("No wallets available for load test");
-
-  const cursor = createAssignmentCursor(wallets);
+  const cursor = isReplay ? null : createAssignmentCursor(wallets);
   /** @type {import('./pathfind-worker.js').PathFindWorker[]} */
   const workers = [];
   const timeline = [];
@@ -713,6 +756,8 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   let lastProgressAt = 0;
   /** Live phase for onEvent → progress routing. */
   let currentPhase = openPhase;
+  /** Ordered plan recorded as sessions launch (or the replay plan as-is). */
+  const requestPlanRecord = [];
 
   const run = {
     startedAt: new Date().toISOString(),
@@ -722,15 +767,21 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
     maxConcurrency,
     observeMs,
     readyTimeoutMs,
-    walletCount: wallets.length,
-    wallets: wallets.map((w) => ({
-      account: w.account,
-      trustlinesWithBalance: w.trustlinesWithBalance,
-      heldTrustlines: w.heldTrustlines,
-    })),
+    walletCount: isReplay ? 0 : wallets.length,
+    wallets: isReplay
+      ? []
+      : wallets.map((w) => ({
+          account: w.account,
+          trustlinesWithBalance: w.trustlinesWithBalance,
+          heldTrustlines: w.heldTrustlines,
+        })),
     timeline: [],
     sessions: [],
     phases: {},
+    /** Ordered path_find creates for exact re-runs */
+    requestPlan: [],
+    replayOf: opts.replayOf || null,
+    isReplay,
   };
 
   const getOpenCount = () => countOpenWorkers(workers);
@@ -792,10 +843,48 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   };
 
   const launchOne = (n) => {
-    const { source, dest } = cursor.next();
     const sessionId = `PF${String(n).padStart(4, "0")}`;
     // Ramp: concurrency grows with n; burst: target is always max
     const concurrencyAtStart = mode === "ramp" ? n : maxConcurrency;
+
+    let source;
+    let dest;
+    let candidates;
+    let selfPathFind = cfg.selfPathFind !== false;
+
+    if (isReplay) {
+      const entry = replayPlan[n - 1];
+      if (!entry) {
+        return Promise.reject(
+          new Error(`request plan missing entry for ${sessionId} (index ${n - 1})`)
+        );
+      }
+      source = { account: entry.source };
+      dest = { account: entry.destination || entry.source };
+      candidates = entry.candidates;
+      selfPathFind = entry.selfPathFind !== false;
+      requestPlanRecord.push({
+        sessionId,
+        source: entry.source,
+        destination: entry.destination || entry.source,
+        selfPathFind,
+        candidates: candidates.map(compactCandidate).filter(Boolean),
+      });
+    } else {
+      const assignment = cursor.next();
+      source = assignment.source;
+      dest = assignment.dest;
+      const tokenWallet = selfPathFind ? source : dest;
+      candidates = pickPathFindCandidates(tokenWallet, 3);
+      requestPlanRecord.push({
+        sessionId,
+        source: source.account,
+        destination: selfPathFind ? source.account : dest.account,
+        selfPathFind,
+        candidates: candidates.map(compactCandidate).filter(Boolean),
+      });
+    }
+
     return startPathFindWorker({
       endpoint: cfg.endpoint,
       sourceWallet: source,
@@ -804,8 +893,9 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
       concurrencyAtStart,
       getOpenCount,
       onEvent,
-      selfPathFind: cfg.selfPathFind !== false,
-      maxTokenAttempts: 3,
+      selfPathFind,
+      maxTokenAttempts: candidates.length || 3,
+      candidates,
     }).then((worker) => {
       workers.push(worker);
       if (worker.state.failed) {
@@ -1058,6 +1148,12 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   run.endedAt = new Date().toISOString();
   run.timeline = timeline;
   run.sessions = workers.map((w) => ({ ...w.state }));
+  // Prefer the plan captured at launch (full candidate lists). Fall back to
+  // reconstructing from session attempts if something went wrong.
+  run.requestPlan =
+    requestPlanRecord.length > 0
+      ? requestPlanRecord
+      : buildRequestPlanFromSessions(run.sessions);
   run.observeStartT = observeStartT;
   run.buckets = bucketByConcurrency(timeline, maxConcurrency);
   run.report = buildReport(run);
@@ -1132,6 +1228,46 @@ function buildReport(run) {
     updateRateOverTimeFull: ratesFull,
     perSessionGapsFull,
     buckets: run.buckets,
+    requestPlan: run.requestPlan || [],
+    replayOf: run.replayOf || null,
+    isReplay: Boolean(run.isReplay),
+  };
+}
+
+/**
+ * Load a request plan from a previous full results JSON (or summary with plan).
+ * @param {string} filePath
+ * @returns {Promise<{ plan: object[], config: object, sourceId: string|null, sourceLabel: string|null }>}
+ */
+export async function loadRequestPlanFromResultsFile(filePath) {
+  const abs = path.resolve(filePath);
+  const raw = await fs.readFile(abs, "utf8");
+  const data = JSON.parse(raw);
+  let plan = normalizeRequestPlan(data.requestPlan);
+  if (!plan.length && Array.isArray(data.sessions)) {
+    plan = buildRequestPlanFromSessions(data.sessions);
+  }
+  if (!plan.length && Array.isArray(data.report?.requestPlan)) {
+    plan = normalizeRequestPlan(data.report.requestPlan);
+  }
+  if (!plan.length) {
+    throw new Error(
+      `No request plan / sessions found in ${abs} — cannot replay`
+    );
+  }
+  return {
+    plan,
+    config: {
+      endpoint: data.endpoint || data.report?.endpoint,
+      mode: data.mode || data.report?.mode,
+      addIntervalMs: data.addIntervalMs ?? data.report?.addIntervalMs,
+      maxConcurrency: plan.length,
+      observeMs: data.observeMs ?? data.report?.observeMs,
+      readyTimeoutMs: data.readyTimeoutMs ?? data.report?.readyTimeoutMs,
+      selfPathFind: true,
+    },
+    sourceId: data.id || null,
+    sourceLabel: data.label || null,
   };
 }
 

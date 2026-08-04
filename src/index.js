@@ -19,7 +19,11 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { DEFAULTS, parseArgs, resolveConfig } from "./config.js";
 import { discoverWallets, saveWallets, loadWallets } from "./discover-wallets.js";
-import { runLoadTest, saveResults } from "./loadtest.js";
+import {
+  runLoadTest,
+  saveResults,
+  loadRequestPlanFromResultsFile,
+} from "./loadtest.js";
 
 function printHelp() {
   console.log(`
@@ -55,6 +59,7 @@ Options:
   --skipDiscover              Reuse walletsFile
   --rediscover                Force fresh discovery
   --discoverOnly              Only discover wallets, then exit
+  --replay=PATH               Rerun: same path_find requests in same order from a prior results JSON
   --inspect                   After run, interactive drill-down of individual sessions
   --help
 
@@ -62,6 +67,7 @@ Examples:
   npm start -- --skipDiscover --max=200 --observeMin=2
   npm start -- --skipDiscover --max=10 --observeSec=30
   npm start -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeSec=60
+  npm start -- --replay=data/results/loadtest-….json --observeSec=60
   npm run discover -- --walletPoolSize=20
 `);
 }
@@ -79,6 +85,55 @@ async function main() {
   const args = parseArgs();
   if (args.help || args.h) {
     printHelp();
+    return;
+  }
+
+  // ── Replay path: same path_find requests in the same order ─────────
+  if (args.replay) {
+    const loaded = await loadRequestPlanFromResultsFile(String(args.replay));
+    const cfg = resolveConfig({
+      endpoint: args.endpoint || loaded.config.endpoint || DEFAULTS.endpoint,
+      resultsDir: args.resultsDir || DEFAULTS.resultsDir,
+      maxConcurrency: loaded.plan.length,
+      mode: args.mode || loaded.config.mode || DEFAULTS.mode,
+      addIntervalMs: args.addIntervalMs ?? loaded.config.addIntervalMs,
+      addIntervalSec: args.addIntervalSec,
+      observeMs: args.observeMs,
+      observeMin: args.observeMin,
+      observeSec: args.observeSec ?? (loaded.config.observeMs
+        ? loaded.config.observeMs / 1000
+        : undefined),
+      holdAtPeakMs: args.holdAtPeakMs,
+      holdAtPeakSec: args.holdAtPeakSec,
+      readyTimeoutMs: args.readyTimeoutMs ?? loaded.config.readyTimeoutMs,
+      readyTimeoutSec: args.readyTimeoutSec,
+      readyTimeoutMin: args.readyTimeoutMin,
+      selfPathFind: true,
+      inspect: Boolean(args.inspect),
+    });
+    cfg.maxConcurrency = loaded.plan.length;
+
+    console.log(
+      `═══ XRPL path_find REPLAY (${cfg.mode} → ready → observe) ═══`
+    );
+    console.log("config:", {
+      endpoint: cfg.endpoint,
+      mode: cfg.mode,
+      addIntervalMs: cfg.mode === "ramp" ? cfg.addIntervalMs : undefined,
+      maxConcurrency: cfg.maxConcurrency,
+      observeMs: cfg.observeMs,
+      readyTimeoutMs: cfg.readyTimeoutMs,
+      replay: path.resolve(String(args.replay)),
+      sourceId: loaded.sourceId,
+      planCount: loaded.plan.length,
+    });
+
+    const run = await runLoadTest(cfg, [], {
+      requestPlan: loaded.plan,
+      replayOf: loaded.sourceId || path.basename(String(args.replay)),
+    });
+    await saveResults(cfg.resultsDir, run);
+    console.log("[main] replay complete.");
     return;
   }
 

@@ -154,10 +154,18 @@ export async function runPathFindSession({
   onEvent,
   selfPathFind = true,
   maxTokenAttempts = 3,
+  /** Pre-selected candidates (replay / deterministic plan). Skips random pick. */
+  candidates: fixedCandidates = null,
 }) {
   // Self: tokens from source. Cross: destination_amount from dest (what they receive).
   const tokenWallet = selfPathFind ? sourceWallet : destWallet;
-  const candidates = pickPathFindCandidates(tokenWallet, maxTokenAttempts);
+  const candidates =
+    Array.isArray(fixedCandidates) && fixedCandidates.length
+      ? fixedCandidates.map((c) => ({
+          destination_amount: c.destination_amount,
+          send_max: c.send_max,
+        }))
+      : pickPathFindCandidates(tokenWallet, maxTokenAttempts);
 
   const session = {
     sessionId,
@@ -420,4 +428,103 @@ function summarizeSession(session) {
     destination_amount: session.destination_amount,
     send_max: session.send_max,
   };
+}
+
+/**
+ * Compact path_find request entry for a single session (replay-safe).
+ * @param {{ destination_amount?: object, send_max?: * }} c
+ */
+export function compactCandidate(c) {
+  if (!c?.destination_amount) return null;
+  return {
+    destination_amount: c.destination_amount,
+    send_max: c.send_max ?? null,
+  };
+}
+
+/**
+ * Build a replayable request plan entry from a live or saved session.
+ * Prefers the ordered attempt list; falls back to the final amounts used.
+ *
+ * @param {object} session
+ * @returns {{ sessionId: string, source: string, destination: string, selfPathFind: boolean, candidates: Array<{destination_amount, send_max}> } | null}
+ */
+export function sessionToPlanEntry(session) {
+  if (!session) return null;
+  const source = session.source || session.source_account;
+  const destination =
+    session.destination || session.destination_account || source;
+  if (!source) return null;
+
+  let candidates = [];
+  if (Array.isArray(session.attempts) && session.attempts.length) {
+    candidates = session.attempts
+      .map((a) => compactCandidate(a))
+      .filter(Boolean);
+  }
+  if (!candidates.length && session.destination_amount) {
+    const one = compactCandidate(session);
+    if (one) candidates = [one];
+  }
+  if (!candidates.length && Array.isArray(session.candidates)) {
+    candidates = session.candidates.map(compactCandidate).filter(Boolean);
+  }
+  if (!candidates.length) return null;
+
+  return {
+    sessionId: session.sessionId || null,
+    source,
+    destination,
+    selfPathFind: !destination || destination === source,
+    candidates,
+  };
+}
+
+/**
+ * Ordered request plan from a finished run's sessions (PF0001, PF0002, …).
+ * @param {object[]} sessions
+ * @returns {Array<object>}
+ */
+export function buildRequestPlanFromSessions(sessions) {
+  if (!Array.isArray(sessions) || !sessions.length) return [];
+  const sorted = [...sessions].sort((a, b) =>
+    String(a.sessionId || "").localeCompare(String(b.sessionId || ""))
+  );
+  return sorted.map(sessionToPlanEntry).filter(Boolean);
+}
+
+/**
+ * Normalize a plan from disk/API (tolerates partial shapes).
+ * @param {unknown} plan
+ * @returns {Array<object>}
+ */
+export function normalizeRequestPlan(plan) {
+  if (!Array.isArray(plan)) return [];
+  return plan
+    .map((entry, i) => {
+      if (!entry?.source) return null;
+      const candidates = (
+        Array.isArray(entry.candidates) && entry.candidates.length
+          ? entry.candidates
+          : entry.destination_amount
+            ? [entry]
+            : []
+      )
+        .map(compactCandidate)
+        .filter(Boolean);
+      if (!candidates.length) return null;
+      const destination = entry.destination || entry.source;
+      return {
+        sessionId:
+          entry.sessionId || `PF${String(i + 1).padStart(4, "0")}`,
+        source: entry.source,
+        destination,
+        selfPathFind:
+          entry.selfPathFind != null
+            ? Boolean(entry.selfPathFind)
+            : destination === entry.source,
+        candidates,
+      };
+    })
+    .filter(Boolean);
 }

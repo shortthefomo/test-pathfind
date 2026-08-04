@@ -27,6 +27,7 @@ import {
   subscribe,
   getActiveRunId,
   compareRuns,
+  getRequestPlan,
 } from "./run-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -102,14 +103,80 @@ async function main() {
     res.json(compareRuns(ids));
   });
 
-  app.post("/api/runs", async (req, res) => {
+  /**
+   * Shared start helper for fresh runs and replays.
+   * @param {object} opts
+   * @param {object} opts.config
+   * @param {string|null} opts.label
+   * @param {object[]|null} opts.requestPlan
+   * @param {string|null} opts.replayOf
+   * @param {object[]} opts.wallets
+   * @param {import('express').Response} res
+   */
+  function startRunAsync({ config, label, requestPlan, replayOf, wallets }, res) {
     if (getActiveRunId()) {
-      return res.status(409).json({
+      res.status(409).json({
         error: "A run is already in progress",
         activeRunId: getActiveRunId(),
       });
+      return null;
     }
 
+    const entry = createRunRecord({
+      config,
+      label,
+      replayOf: replayOf || null,
+    });
+    if (!claimActive(entry.id)) {
+      res.status(409).json({ error: "Could not claim active run slot" });
+      return null;
+    }
+
+    res.status(202).json({
+      id: entry.id,
+      label: entry.label,
+      status: entry.status,
+      config: entry.config,
+      replayOf: entry.replayOf,
+      isReplay: Boolean(requestPlan?.length),
+      requestPlanCount: requestPlan?.length || 0,
+    });
+
+    (async () => {
+      try {
+        const mode = config.mode;
+        console.log(
+          `[api] starting run ${entry.id}` +
+            (requestPlan?.length
+              ? ` REPLAY of ${replayOf} (${requestPlan.length} path_finds)`
+              : "") +
+            ` mode=${mode}` +
+            (mode === "ramp"
+              ? ` interval=${Math.round((config.addIntervalMs || 0) / 1000)}s`
+              : "") +
+            ` max=${config.maxConcurrency} observe=${Math.round((config.observeMs || 0) / 1000)}s endpoint=${config.endpoint}`
+        );
+        const fullRun = await runLoadTest(config, wallets, {
+          quiet: true,
+          onProgress: (snap) => setProgress(entry.id, snap),
+          requestPlan: requestPlan || null,
+          replayOf: replayOf || null,
+        });
+        fullRun.id = entry.id;
+        fullRun.label = entry.label;
+        await completeRun(entry.id, fullRun);
+        console.log(`[api] run ${entry.id} complete`);
+      } catch (err) {
+        console.error(`[api] run ${entry.id} failed:`, err);
+        failRun(entry.id, err);
+        releaseActive(entry.id);
+      }
+    })();
+
+    return entry;
+  }
+
+  app.post("/api/runs", async (req, res) => {
     const body = req.body || {};
     let maxConcurrency = Number(body.maxConcurrency ?? DEFAULTS.maxConcurrency ?? 50);
     if (!Number.isFinite(maxConcurrency)) maxConcurrency = 50;
@@ -173,40 +240,110 @@ async function main() {
       });
     }
 
-    const entry = createRunRecord({ config, label });
-    if (!claimActive(entry.id)) {
-      return res.status(409).json({ error: "Could not claim active run slot" });
+    startRunAsync({ config, label, requestPlan: null, replayOf: null, wallets }, res);
+  });
+
+  /**
+   * Rerun a previous run with the same path_find requests in the same order.
+   * Body may override endpoint / observeSec / readyTimeoutSec / mode / addIntervalSec / label.
+   */
+  app.post("/api/runs/:id/rerun", async (req, res) => {
+    const sourceId = req.params.id;
+    const source = getRun(sourceId);
+    if (!source) {
+      return res.status(404).json({ error: "run not found" });
+    }
+    if (source.status === "running" || source.status === "queued") {
+      return res.status(409).json({ error: "Cannot rerun a run that is still active" });
     }
 
-    res.status(202).json({
-      id: entry.id,
-      label: entry.label,
-      status: entry.status,
-      config: entry.config,
-    });
+    let requestPlan;
+    try {
+      requestPlan = await getRequestPlan(sourceId);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
 
-    // Fire-and-forget run
-    (async () => {
-      try {
-        console.log(
-          `[api] starting run ${entry.id} mode=${mode}` +
-            (mode === "ramp" ? ` interval=${addIntervalSec}s` : "") +
-            ` max=${maxConcurrency} observe=${observeSec}s endpoint=${endpoint}`
-        );
-        const fullRun = await runLoadTest(config, wallets, {
-          quiet: true,
-          onProgress: (snap) => setProgress(entry.id, snap),
-        });
-        fullRun.id = entry.id;
-        fullRun.label = entry.label;
-        await completeRun(entry.id, fullRun);
-        console.log(`[api] run ${entry.id} complete`);
-      } catch (err) {
-        console.error(`[api] run ${entry.id} failed:`, err);
-        failRun(entry.id, err);
-        releaseActive(entry.id);
-      }
-    })();
+    const body = req.body || {};
+    const srcCfg = source.config || {};
+
+    let observeSec = Number(
+      body.observeSec ??
+        Math.round((srcCfg.observeMs || DEFAULTS.observeMs || 30_000) / 1000)
+    );
+    if (!Number.isFinite(observeSec) || observeSec < 1) observeSec = 30;
+    observeSec = Math.min(3600, Math.floor(observeSec));
+
+    let readyTimeoutSec = Number(
+      body.readyTimeoutSec ??
+        Math.round((srcCfg.readyTimeoutMs || 120_000) / 1000)
+    );
+    if (!Number.isFinite(readyTimeoutSec) || readyTimeoutSec < 5) {
+      readyTimeoutSec = 120;
+    }
+
+    const mode =
+      String(body.mode || srcCfg.mode || DEFAULTS.mode || "ramp").toLowerCase() ===
+      "burst"
+        ? "burst"
+        : "ramp";
+
+    let addIntervalSec = Number(
+      body.addIntervalSec ??
+        Math.round((srcCfg.addIntervalMs || DEFAULTS.addIntervalMs || 1_000) / 1000)
+    );
+    if (!Number.isFinite(addIntervalSec) || addIntervalSec < 0) {
+      addIntervalSec = 1;
+    }
+    addIntervalSec = Math.min(60, addIntervalSec);
+    const addIntervalMs =
+      mode === "ramp" ? Math.round(addIntervalSec * 1000) : 0;
+
+    const endpoint = String(
+      body.endpoint || srcCfg.endpoint || DEFAULTS.endpoint
+    ).trim();
+
+    const label =
+      body.label != null
+        ? String(body.label).slice(0, 80)
+        : `replay←${sourceId}`;
+
+    const config = {
+      endpoint,
+      mode,
+      addIntervalMs,
+      maxConcurrency: requestPlan.length,
+      observeMs: observeSec * 1000,
+      readyTimeoutMs: readyTimeoutSec * 1000,
+      selfPathFind: true,
+    };
+
+    // Replay does not need wallets; pass empty array
+    startRunAsync(
+      {
+        config,
+        label,
+        requestPlan,
+        replayOf: sourceId,
+        wallets: [],
+      },
+      res
+    );
+  });
+
+  /** Inspect the request plan that would be replayed for a run. */
+  app.get("/api/runs/:id/plan", async (req, res) => {
+    try {
+      const plan = await getRequestPlan(req.params.id);
+      res.json({
+        id: req.params.id,
+        count: plan.length,
+        plan,
+      });
+    } catch (err) {
+      const status = String(err.message || "").includes("not found") ? 404 : 400;
+      res.status(status).json({ error: err.message });
+    }
   });
 
   app.get("/api/runs/:id/events", (req, res) => {

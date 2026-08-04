@@ -6,7 +6,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { summarizeRunForUi, saveResults } from "../src/loadtest.js";
+import {
+  summarizeRunForUi,
+  saveResults,
+  loadRequestPlanFromResultsFile,
+} from "../src/loadtest.js";
+import {
+  buildRequestPlanFromSessions,
+  normalizeRequestPlan,
+} from "../src/pathfind-session.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -35,20 +43,34 @@ export function getRun(id) {
 
 function stripHeavy(entry) {
   const { fullRun, listeners, ...rest } = entry;
-  return rest;
+  return {
+    ...rest,
+    canRerun: Boolean(
+      (Array.isArray(rest.requestPlan) && rest.requestPlan.length) ||
+        rest.summary?.canRerun ||
+        rest.resultsPath
+    ),
+    requestPlanCount:
+      (Array.isArray(rest.requestPlan) && rest.requestPlan.length) ||
+      rest.summary?.requestPlanCount ||
+      0,
+    // Do not send full plan in list payloads (can be large); keep on entry for rerun
+    requestPlan: undefined,
+  };
 }
 
-export function createRunRecord({ config, label }) {
+export function createRunRecord({ config, label, replayOf = null }) {
   const id = randomUUID().slice(0, 8);
   const modeTag =
     config.mode === "ramp"
       ? `ramp/${Math.round((config.addIntervalMs || 0) / 1000)}s · `
       : "";
+  const replayTag = replayOf ? `replay←${replayOf} · ` : "";
   const entry = {
     id,
     label:
       label ||
-      `${modeTag}${config.maxConcurrency} open · ${Math.round((config.observeMs || 0) / 1000)}s`,
+      `${replayTag}${modeTag}${config.maxConcurrency} open · ${Math.round((config.observeMs || 0) / 1000)}s`,
     status: "queued",
     startedAt: new Date().toISOString(),
     endedAt: null,
@@ -56,6 +78,10 @@ export function createRunRecord({ config, label }) {
     progress: null,
     summary: null,
     error: null,
+    /** Ordered path_find creates for exact re-runs */
+    requestPlan: null,
+    replayOf: replayOf || null,
+    resultsPath: null,
     /** @type {Set<(payload: object) => void>} */
     listeners: new Set(),
     fullRun: null,
@@ -113,11 +139,20 @@ export async function completeRun(id, fullRun) {
   entry.fullRun = fullRun;
   entry.endedAt = fullRun.endedAt || new Date().toISOString();
   entry.status = "done";
-  entry.summary = summarizeRunForUi(fullRun, {
-    id,
-    label: entry.label,
-    status: "done",
-  });
+  // Keep compact plan on the entry so reruns work after fullRun is GC'd later
+  let plan = normalizeRequestPlan(fullRun.requestPlan);
+  if (!plan.length && Array.isArray(fullRun.sessions)) {
+    plan = buildRequestPlanFromSessions(fullRun.sessions);
+  }
+  entry.requestPlan = plan.length ? plan : null;
+  entry.summary = summarizeRunForUi(
+    { ...fullRun, requestPlan: plan },
+    {
+      id,
+      label: entry.label,
+      status: "done",
+    }
+  );
   entry.progress = {
     ...(entry.progress || {}),
     phase: "done",
@@ -126,11 +161,13 @@ export async function completeRun(id, fullRun) {
   if (activeRunId === id) activeRunId = null;
 
   try {
-    await saveResults(RESULTS_DIR, {
+    const saved = await saveResults(RESULTS_DIR, {
       ...fullRun,
       id,
       label: entry.label,
+      requestPlan: plan,
     });
+    entry.resultsPath = saved?.fullPath || null;
     await persistIndex();
   } catch (err) {
     console.warn("[run-store] persist failed:", err.message);
@@ -138,6 +175,80 @@ export async function completeRun(id, fullRun) {
 
   broadcast(entry, { type: "done", data: entry.summary });
   return entry.summary;
+}
+
+/**
+ * Resolve the ordered path_find request plan for a completed run.
+ * Checks in-memory plan, fullRun, then on-disk results by id / resultsPath.
+ *
+ * @param {string} id
+ * @returns {Promise<object[]>}
+ */
+export async function getRequestPlan(id) {
+  const entry = runs.get(id);
+  if (!entry) {
+    throw new Error(`run not found: ${id}`);
+  }
+
+  let plan = normalizeRequestPlan(entry.requestPlan);
+  if (plan.length) return plan;
+
+  if (entry.fullRun) {
+    plan = normalizeRequestPlan(entry.fullRun.requestPlan);
+    if (!plan.length && Array.isArray(entry.fullRun.sessions)) {
+      plan = buildRequestPlanFromSessions(entry.fullRun.sessions);
+    }
+    if (plan.length) {
+      entry.requestPlan = plan;
+      return plan;
+    }
+  }
+
+  // Prefer explicit results path
+  if (entry.resultsPath) {
+    try {
+      const loaded = await loadRequestPlanFromResultsFile(entry.resultsPath);
+      entry.requestPlan = loaded.plan;
+      return loaded.plan;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // Scan results dir for a full JSON with matching id
+  try {
+    const files = await fs.readdir(RESULTS_DIR);
+    const fulls = files.filter(
+      (f) =>
+        f.startsWith("loadtest-") &&
+        f.endsWith(".json") &&
+        !f.endsWith("-summary.json")
+    );
+    for (const f of fulls.slice().reverse()) {
+      try {
+        const raw = await fs.readFile(path.join(RESULTS_DIR, f), "utf8");
+        const data = JSON.parse(raw);
+        if (data.id !== id) continue;
+        plan = normalizeRequestPlan(data.requestPlan);
+        if (!plan.length && Array.isArray(data.sessions)) {
+          plan = buildRequestPlanFromSessions(data.sessions);
+        }
+        if (plan.length) {
+          entry.requestPlan = plan;
+          entry.resultsPath = path.join(RESULTS_DIR, f);
+          return plan;
+        }
+      } catch {
+        /* skip */
+      }
+    }
+  } catch {
+    /* no dir */
+  }
+
+  throw new Error(
+    `No request plan available for run ${id}. Re-run a new test first (older results may lack path_find request details).`
+  );
 }
 
 export function failRun(id, error) {
@@ -170,15 +281,24 @@ export function releaseActive(id) {
 
 async function persistIndex() {
   await fs.mkdir(RESULTS_DIR, { recursive: true });
-  const index = listRuns().map((r) => ({
+  // Persist plan so reruns work after server restart without re-reading multi-MB full JSON
+  const index = [...runs.values()].map((r) => ({
     id: r.id,
     label: r.label,
     status: r.status,
     startedAt: r.startedAt,
     endedAt: r.endedAt,
     config: r.config,
-    summary: r.summary,
+    summary: r.summary
+      ? {
+          ...r.summary,
+          // strip heavy series from index? keep as-is for now (already there)
+        }
+      : null,
     error: r.error,
+    replayOf: r.replayOf || null,
+    resultsPath: r.resultsPath || null,
+    requestPlan: r.requestPlan || null,
   }));
   await fs.writeFile(INDEX_PATH, JSON.stringify(index, null, 2));
 }
@@ -193,6 +313,7 @@ export async function loadFromDisk() {
     if (Array.isArray(index)) {
       for (const item of index) {
         if (!item?.id) continue;
+        const plan = normalizeRequestPlan(item.requestPlan);
         runs.set(item.id, {
           id: item.id,
           label: item.label,
@@ -201,8 +322,22 @@ export async function loadFromDisk() {
           endedAt: item.endedAt,
           config: item.config,
           progress: null,
-          summary: item.summary,
+          summary: item.summary
+            ? {
+                ...item.summary,
+                canRerun:
+                  plan.length > 0 ||
+                  item.summary.canRerun ||
+                  Boolean(item.resultsPath),
+                requestPlanCount:
+                  plan.length || item.summary.requestPlanCount || 0,
+                replayOf: item.replayOf || item.summary.replayOf || null,
+              }
+            : null,
           error: item.error || null,
+          requestPlan: plan.length ? plan : null,
+          replayOf: item.replayOf || null,
+          resultsPath: item.resultsPath || null,
           listeners: new Set(),
           fullRun: null,
         });

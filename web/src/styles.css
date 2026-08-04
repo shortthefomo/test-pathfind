@@ -282,6 +282,19 @@ code {
   background: transparent;
 }
 
+.btn.sm {
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+
+.actions-cell {
+  text-align: right;
+  width: 1%;
+}
+
 .phase-badge {
   text-transform: uppercase;
   font-size: 0.72rem;
@@ -491,6 +504,12 @@ tbody tr.active {
 .status-tag.queued {
   color: var(--accent);
 }
+.status-tag.replay {
+  background: rgba(167, 139, 250, 0.15);
+  color: #c4b5fd;
+  border: 1px solid rgba(167, 139, 250, 0.35);
+}
+
 .status-tag.error {
   color: var(--danger);
 }

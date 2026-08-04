@@ -27,6 +27,22 @@ export async function startRun(body) {
   return data;
 }
 
+/**
+ * Rerun a completed run with the same path_find requests in the same order.
+ * @param {string} id
+ * @param {object} [body] optional overrides (endpoint, observeSec, mode, …)
+ */
+export async function rerunRun(id, body = {}) {
+  const r = await fetch(`/api/runs/${encodeURIComponent(id)}/rerun`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
 export async function compareRuns(ids) {
   const r = await fetch(`/api/compare?ids=${ids.map(encodeURIComponent).join(",")}`);
   if (!r.ok) throw new Error(await r.text());

@@ -9,6 +9,7 @@ import {
   getHealth,
   listRuns,
   startRun,
+  rerunRun,
   watchRun,
   compareRuns,
   getRun,
@@ -86,28 +87,46 @@ function attachWatch(id) {
   });
 }
 
+function beginLiveWatch(started, message = "Starting…") {
+  activeRunId.value = started.id;
+  liveMeta.value = started;
+  const startMode = started.config?.mode === "ramp" ? "ramp" : "burst";
+  liveProgress.value = {
+    phase: startMode === "ramp" ? "ramp_up" : "burst",
+    mode: startMode,
+    addIntervalMs: started.config?.addIntervalMs ?? 0,
+    maxConcurrency: started.config.maxConcurrency,
+    observeMs: started.config.observeMs,
+    opened: 0,
+    failed: 0,
+    ready: 0,
+    createLatencies: [],
+    updateGapBuckets: [],
+    updateRateBuckets: [],
+    message,
+  };
+  attachWatch(started.id);
+}
+
 async function onStart(opts) {
   error.value = null;
   try {
     const started = await startRun(opts);
-    activeRunId.value = started.id;
-    liveMeta.value = started;
-    const startMode = started.config?.mode === "ramp" ? "ramp" : "burst";
-    liveProgress.value = {
-      phase: startMode === "ramp" ? "ramp_up" : "burst",
-      mode: startMode,
-      addIntervalMs: started.config?.addIntervalMs ?? 0,
-      maxConcurrency: started.config.maxConcurrency,
-      observeMs: started.config.observeMs,
-      opened: 0,
-      failed: 0,
-      ready: 0,
-      createLatencies: [],
-      updateGapBuckets: [],
-      updateRateBuckets: [],
-      message: "Starting…",
-    };
-    attachWatch(started.id);
+    beginLiveWatch(started, "Starting…");
+    await refreshRuns();
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+async function onRerun(id) {
+  error.value = null;
+  try {
+    const started = await rerunRun(id);
+    beginLiveWatch(
+      started,
+      `Replaying ${started.requestPlanCount || "?"} path_finds from ${id}…`
+    );
     await refreshRuns();
   } catch (e) {
     error.value = e.message;
@@ -203,8 +222,10 @@ onBeforeUnmount(() => {
       :selected="selectedIds"
       :active-id="activeRunId"
       :detail-id="detailId"
+      :busy="busy"
       @toggle="onToggle"
       @select-detail="onSelectDetail"
+      @rerun="onRerun"
     />
 
     <CompareView :compare="compare" />

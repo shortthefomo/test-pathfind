@@ -6,12 +6,22 @@ defineProps({
   selected: { type: Array, default: () => [] },
   activeId: { type: String, default: null },
   detailId: { type: String, default: null },
+  busy: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["toggle", "select-detail"]);
+const emit = defineEmits(["toggle", "select-detail", "rerun"]);
 
 function isChecked(id, selected) {
   return selected.includes(id);
+}
+
+function canRerun(r) {
+  if (!r || r.status !== "done") return false;
+  if (r.canRerun) return true;
+  if (r.summary?.canRerun) return true;
+  if ((r.requestPlanCount || r.summary?.requestPlanCount || 0) > 0) return true;
+  // Older runs: try disk lookup via API (server will error if no plan)
+  return Boolean(r.resultsPath || r.summary);
 }
 </script>
 
@@ -21,7 +31,8 @@ function isChecked(id, selected) {
       <h2>Run history</h2>
       <p class="muted">
         Select 2+ completed runs to compare fall-offs. Click a row for detail
-        charts.
+        charts. <strong>Rerun</strong> repeats the same path_find requests in
+        order.
       </p>
     </header>
 
@@ -43,6 +54,7 @@ function isChecked(id, selected) {
             <th>Upd gap p50</th>
             <th>Success</th>
             <th>When</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -67,6 +79,13 @@ function isChecked(id, selected) {
             <td class="label-cell">
               <strong>{{ r.label }}</strong>
               <span class="status-tag" :class="r.status">{{ r.status }}</span>
+              <span
+                v-if="r.replayOf || r.summary?.replayOf || r.summary?.isReplay"
+                class="status-tag replay"
+                :title="`Replay of ${r.replayOf || r.summary?.replayOf || '?'}`"
+              >
+                replay
+              </span>
             </td>
             <td class="muted">
               <template v-if="r.config?.mode === 'ramp'">
@@ -87,6 +106,17 @@ function isChecked(id, selected) {
             <td>{{ fmtPct(r.summary?.stats?.successRate) }}</td>
             <td class="muted mono">
               {{ r.startedAt ? new Date(r.startedAt).toLocaleString() : "—" }}
+            </td>
+            <td class="actions-cell" @click.stop>
+              <button
+                type="button"
+                class="btn ghost sm"
+                :disabled="busy || !canRerun(r)"
+                title="Repeat this run with the same path_find requests in the same order"
+                @click="emit('rerun', r.id)"
+              >
+                Rerun
+              </button>
             </td>
           </tr>
         </tbody>

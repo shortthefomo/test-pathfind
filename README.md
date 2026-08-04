@@ -44,6 +44,7 @@ Open **http://localhost:5173**
 - Set **observe** window (hold time at cap in ramp mode)
 - **Fire test round** — live charts stream over SSE
 - Multi-select history rows → **Compare** charts
+- **Rerun** on a history row — repeats the same `path_find` creates (source, dest, amounts) in the same order for an apples-to-apples re-test
 
 Only **one** run at a time.
 
@@ -53,6 +54,7 @@ Only **one** run at a time.
 npm run cli -- --skipDiscover --max=200 --observeMin=2
 npm run cli -- --skipDiscover --max=10 --observeSec=30 --inspect
 npm run cli -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeSec=60
+npm run cli -- --replay=data/results/loadtest-….json --observeSec=60
 ```
 
 | Flag | Default | Meaning |
@@ -65,7 +67,16 @@ npm run cli -- --skipDiscover --mode=ramp --addIntervalSec=3 --max=50 --observeS
 | `--observeSec` | `30` | Observe / hold-at-cap window (seconds) |
 | `--readyTimeoutSec` | `120` | Max wait for all sessions to update |
 | `--skipDiscover` | | Use `data/wallets.json` |
+| `--replay=PATH` | | Rerun a prior results JSON with the same path_find sequence |
 | `--inspect` | | Interactive session drill-down after CLI run |
+
+### Rerunning a test
+
+Every completed run records an ordered **request plan** (`requestPlan`): each session’s `source`, `destination`, `destination_amount`, and `send_max` (including token-retry candidates).
+
+- **UI:** click **Rerun** on a history row → `POST /api/runs/:id/rerun`
+- **CLI:** `--replay=path/to/loadtest-….json` (full results file preferred; works from sessions if plan is missing)
+- Timing knobs (`mode`, interval, observe window, endpoint) can still be overridden; only the path_find *payloads* and their order are fixed.
 
 ## Why multiple connections?
 
