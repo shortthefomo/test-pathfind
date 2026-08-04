@@ -295,6 +295,52 @@ code {
   width: 1%;
 }
 
+.endpoint-cell {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.82rem;
+}
+
+.rerun-panel {
+  margin-bottom: 14px;
+  padding: 14px 14px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.rerun-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.rerun-panel-head strong {
+  color: var(--accent);
+}
+
+.rerun-panel .field {
+  margin-bottom: 10px;
+}
+
+.rerun-panel .form-footer {
+  margin-top: 4px;
+}
+
+.rerun-panel .form-footer .hint {
+  margin: 0;
+  flex: 1;
+  min-width: 180px;
+}
+
+tbody tr.rerun-source {
+  background: rgba(56, 189, 248, 0.1);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 .phase-badge {
   text-transform: uppercase;
   font-size: 0.72rem;

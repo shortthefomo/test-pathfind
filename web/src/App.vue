@@ -119,13 +119,27 @@ async function onStart(opts) {
   }
 }
 
-async function onRerun(id) {
+async function onRerun(payload) {
+  // Accept legacy string id or { id, endpoint, …overrides }
+  const id = typeof payload === "string" ? payload : payload?.id;
+  const body =
+    typeof payload === "object" && payload
+      ? Object.fromEntries(
+          Object.entries(payload).filter(
+            ([k, v]) => k !== "id" && v !== undefined && v !== ""
+          )
+        )
+      : {};
+  if (!id) return;
   error.value = null;
   try {
-    const started = await rerunRun(id);
+    const started = await rerunRun(id, body);
+    const ep = started.config?.endpoint;
     beginLiveWatch(
       started,
-      `Replaying ${started.requestPlanCount || "?"} path_finds from ${id}…`
+      `Replaying ${started.requestPlanCount || "?"} path_finds from ${id}${
+        ep ? ` @ ${ep}` : ""
+      }…`
     );
     await refreshRuns();
   } catch (e) {
@@ -223,6 +237,7 @@ onBeforeUnmount(() => {
       :active-id="activeRunId"
       :detail-id="detailId"
       :busy="busy"
+      :default-endpoint="health?.endpoint || ''"
       @toggle="onToggle"
       @select-detail="onSelectDetail"
       @rerun="onRerun"
