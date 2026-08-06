@@ -77,33 +77,49 @@ const successFalloff = computed(() => {
   };
 });
 
+/** Match server-side UPDATE_BUCKET_MS — gap series only emit non-empty buckets. */
+const OVERLAY_BUCKET_MS = 3_000;
+
 const overlayGap = computed(() => {
-  // Align by index into each series (relative observe time)
+  // Align by run-relative wall time (tMs), NOT array index.
+  // bucketTimeSeries only stores buckets that have samples, so a slow server
+  // (large update gaps) has fewer points spanning the same duration as a fast
+  // one. Index-alignment compresses the sparse series on the X axis.
   const seriesList = runs.value;
   if (!seriesList.length) return { labels: [], datasets: [] };
 
-  // Use max length labels from the longest series
-  let maxLen = 0;
-  let baseLabels = [];
+  let maxT = 0;
   for (const r of seriesList) {
-    const pts = r.series?.updateGapBuckets || [];
-    if (pts.length > maxLen) {
-      maxLen = pts.length;
-      baseLabels = pts.map((p, i) => {
-        // relative to first bucket of this run
-        const t0 = pts[0]?.tMs ?? 0;
-        return ((p.tMs - t0) / 1000).toFixed(0) + "s";
-      });
+    for (const p of r.series?.updateGapBuckets || []) {
+      if (p?.tMs != null && p.tMs > maxT) maxT = p.tMs;
     }
   }
+  if (maxT <= 0) return { labels: [], datasets: [] };
+
+  const grid = [];
+  for (let t = 0; t <= maxT; t += OVERLAY_BUCKET_MS) grid.push(t);
+  if (!grid.length) grid.push(0);
+  // Ensure last real sample can land on the axis
+  if (grid[grid.length - 1] < maxT) grid.push(grid[grid.length - 1] + OVERLAY_BUCKET_MS);
+
+  const labels = grid.map((t) => (t / 1000).toFixed(0) + "s");
 
   return {
-    labels: baseLabels,
+    labels,
     datasets: seriesList.map((r, i) => {
       const pts = r.series?.updateGapBuckets || [];
-      const t0 = pts[0]?.tMs ?? 0;
-      // Map to relative seconds for rough overlay; pad with nulls
-      const data = baseLabels.map((_, idx) => pts[idx]?.ms ?? null);
+      // Accumulate samples per grid slot (sparse → dense shared axis)
+      const acc = grid.map(() => []);
+      for (const p of pts) {
+        if (p?.tMs == null || p.ms == null || !Number.isFinite(p.ms)) continue;
+        let idx = Math.round(p.tMs / OVERLAY_BUCKET_MS);
+        if (idx < 0) idx = 0;
+        if (idx >= acc.length) idx = acc.length - 1;
+        acc[idx].push(p.ms);
+      }
+      const data = acc.map((vals) =>
+        vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null
+      );
       return {
         label: `${r.label} (max ${r.config.maxConcurrency})`,
         data,
@@ -200,7 +216,7 @@ const insights = computed(() => {
         <LineChart
           title="Update gap over time (overlay by run)"
           y-title="ms"
-          x-title="observe-relative time"
+          x-title="run time"
           :labels="overlayGap.labels"
           :datasets="overlayGap.datasets"
           :height="280"

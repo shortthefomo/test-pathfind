@@ -253,6 +253,11 @@ const PATHFIND_KEYS = [
   { key: "STPath", color: "#a78bfa" },
   { key: "STPathElement", color: "#34d399" },
   { key: "STPathSet", color: "#f472b6" },
+  { key: "pathfind_cache_hits", color: "#22d3ee" },
+  { key: "pathfind_cache_misses", color: "#fb7185" },
+  { key: "pathfind_lines_loaded", color: "#f97316" },
+  { key: "pathfind_cache_rebuilds", color: "#e879f9" },
+  { key: "pathfind_cache_lines", color: "#a3e635" },
 ];
 
 const pathfindChart = computed(() => {
@@ -287,6 +292,8 @@ const pathfindChart = computed(() => {
     let data = pts.map((p) => p[key] ?? p.pathfind?.[key] ?? null);
     if (pre) data = [null, ...data];
     for (let i = 0; i < extra - pre; i++) data.push(null);
+    // Only plot series that reported at least one sample (avoids empty legend noise)
+    if (!data.some((v) => v != null)) return null;
     return {
       label: key,
       data,
@@ -296,7 +303,7 @@ const pathfindChart = computed(() => {
       spanGaps: true,
       borderWidth: 1.5,
     };
-  });
+  }).filter(Boolean);
 
   return {
     labels: padBase.labels,
@@ -396,6 +403,26 @@ const pathfindChart = computed(() => {
           <span class="stat-label">PathFindTrustLine</span>
           <span class="stat-val">{{ consensusLatest.PathFindTrustLine }}</span>
         </div>
+        <div class="stat" v-if="consensusLatest?.pathfind_cache_hits != null">
+          <span class="stat-label">cache_hits</span>
+          <span class="stat-val">{{ consensusLatest.pathfind_cache_hits }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.pathfind_cache_misses != null">
+          <span class="stat-label">cache_misses</span>
+          <span class="stat-val">{{ consensusLatest.pathfind_cache_misses }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.pathfind_lines_loaded != null">
+          <span class="stat-label">lines_loaded</span>
+          <span class="stat-val">{{ consensusLatest.pathfind_lines_loaded }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.pathfind_cache_rebuilds != null">
+          <span class="stat-label">cache_rebuilds</span>
+          <span class="stat-val">{{ consensusLatest.pathfind_cache_rebuilds }}</span>
+        </div>
+        <div class="stat" v-if="consensusLatest?.pathfind_cache_lines != null">
+          <span class="stat-label">cache_lines</span>
+          <span class="stat-val">{{ consensusLatest.pathfind_cache_lines }}</span>
+        </div>
       </div>
       <p v-if="progress.message" class="msg">{{ progress.message }}</p>
       <p
@@ -487,7 +514,7 @@ const pathfindChart = computed(() => {
         />
         <LineChart
           v-if="pathfindChart"
-          title="Pathfind object counts (get_counts)"
+          title="Pathfind object counts + cache (get_counts)"
           y-title="in-memory"
           x-title="run time"
           :labels="pathfindChart.labels"

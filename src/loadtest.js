@@ -426,6 +426,21 @@ function printObserveDashboard({
         (L.PathFindTrustLine != null
           ? `  PathFindTrustLine=${L.PathFindTrustLine}`
           : "") +
+        (L.pathfind_cache_hits != null
+          ? `  cache_hits=${L.pathfind_cache_hits}`
+          : "") +
+        (L.pathfind_cache_misses != null
+          ? `  cache_misses=${L.pathfind_cache_misses}`
+          : "") +
+        (L.pathfind_lines_loaded != null
+          ? `  lines_loaded=${L.pathfind_lines_loaded}`
+          : "") +
+        (L.pathfind_cache_rebuilds != null
+          ? `  cache_rebuilds=${L.pathfind_cache_rebuilds}`
+          : "") +
+        (L.pathfind_cache_lines != null
+          ? `  cache_lines=${L.pathfind_cache_lines}`
+          : "") +
         (consensus.stateChanges?.length
           ? `  state_changes=${consensus.stateChanges.length}`
           : "")
@@ -672,6 +687,11 @@ export function applyReportSeriesToSummary(summary, report) {
       STPath: p.STPath ?? null,
       STPathElement: p.STPathElement ?? null,
       STPathSet: p.STPathSet ?? null,
+      pathfind_cache_hits: p.pathfind_cache_hits ?? null,
+      pathfind_cache_misses: p.pathfind_cache_misses ?? null,
+      pathfind_lines_loaded: p.pathfind_lines_loaded ?? null,
+      pathfind_cache_rebuilds: p.pathfind_cache_rebuilds ?? null,
+      pathfind_cache_lines: p.pathfind_cache_lines ?? null,
       pathfind: p.pathfind || null,
     }));
   }
@@ -824,6 +844,11 @@ export function summarizeRunForUi(run, { id, label, status = "done" } = {}) {
         STPath: p.STPath ?? null,
         STPathElement: p.STPathElement ?? null,
         STPathSet: p.STPathSet ?? null,
+        pathfind_cache_hits: p.pathfind_cache_hits ?? null,
+        pathfind_cache_misses: p.pathfind_cache_misses ?? null,
+        pathfind_lines_loaded: p.pathfind_lines_loaded ?? null,
+        pathfind_cache_rebuilds: p.pathfind_cache_rebuilds ?? null,
+        pathfind_cache_lines: p.pathfind_cache_lines ?? null,
         pathfind: p.pathfind || null,
       })),
     },
@@ -1775,7 +1800,7 @@ function printConsensusReport(consensus) {
             (last.write_load != null ? `  write_load=${last.write_load}` : "")
           : "")
     );
-    // Pathfinding in-memory object counts (xrpl::PathRequest, STPath, …)
+    // Pathfinding in-memory object counts + AssetCache counters
     const pf = consensus.pathfindCounts;
     if (pf) {
       console.log("  pathfind object counts (get_counts):");
@@ -1785,6 +1810,11 @@ function printConsensusReport(consensus) {
         "STPath",
         "STPathElement",
         "STPathSet",
+        "pathfind_cache_hits",
+        "pathfind_cache_misses",
+        "pathfind_lines_loaded",
+        "pathfind_cache_rebuilds",
+        "pathfind_cache_lines",
       ]) {
         const row = pf[key];
         if (!row) continue;

@@ -212,6 +212,11 @@ const PATHFIND_KEYS = [
   { key: "STPath", color: "#a78bfa" },
   { key: "STPathElement", color: "#34d399" },
   { key: "STPathSet", color: "#f472b6" },
+  { key: "pathfind_cache_hits", color: "#22d3ee" },
+  { key: "pathfind_cache_misses", color: "#fb7185" },
+  { key: "pathfind_lines_loaded", color: "#f97316" },
+  { key: "pathfind_cache_rebuilds", color: "#e879f9" },
+  { key: "pathfind_cache_lines", color: "#a3e635" },
 ];
 
 const pathfindChart = computed(() => {
@@ -244,6 +249,8 @@ const pathfindChart = computed(() => {
     let data = pts.map((p) => p[key] ?? p.pathfind?.[key] ?? null);
     if (pre) data = [null, ...data];
     for (let i = 0; i < extra - pre; i++) data.push(null);
+    // Only plot series that reported at least one sample (avoids empty legend noise)
+    if (!data.some((v) => v != null)) return null;
     return {
       label: key,
       data,
@@ -253,7 +260,7 @@ const pathfindChart = computed(() => {
       spanGaps: true,
       borderWidth: 1.5,
     };
-  });
+  }).filter(Boolean);
 
   return {
     labels: padBase.labels,
@@ -422,7 +429,7 @@ const pathfindSummary = computed(() => {
       />
       <LineChart
         v-if="pathfindChart"
-        title="Pathfind object counts (get_counts)"
+        title="Pathfind object counts + cache (get_counts)"
         y-title="in-memory"
         x-title="run time"
         :labels="pathfindChart.labels"
