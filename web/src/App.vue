@@ -33,6 +33,18 @@ const busy = computed(
 
 let unwatch = null;
 let pollTimer = null;
+/** Coalesce SSE progress so Vue/Chart.js never process every path_find tick. */
+let pendingProgress = null;
+let progressFlushTimer = null;
+const PROGRESS_FLUSH_MS = 250;
+
+function flushLiveProgress() {
+  progressFlushTimer = null;
+  if (pendingProgress != null) {
+    liveProgress.value = pendingProgress;
+    pendingProgress = null;
+  }
+}
 
 async function refreshHealth() {
   try {
@@ -57,10 +69,25 @@ async function refreshRuns() {
 
 function attachWatch(id) {
   if (unwatch) unwatch();
+  if (progressFlushTimer) {
+    clearTimeout(progressFlushTimer);
+    progressFlushTimer = null;
+  }
+  pendingProgress = null;
   unwatch = watchRun(id, (payload) => {
     if (payload.type === "progress") {
-      liveProgress.value = payload.data;
+      // Keep latest snapshot only; flush on a short cadence so charts stay live
+      // without main-thread thrash during observe (was every follow_up).
+      pendingProgress = payload.data;
+      if (!progressFlushTimer) {
+        progressFlushTimer = setTimeout(flushLiveProgress, PROGRESS_FLUSH_MS);
+      }
     } else if (payload.type === "done") {
+      if (progressFlushTimer) {
+        clearTimeout(progressFlushTimer);
+        progressFlushTimer = null;
+      }
+      pendingProgress = null;
       liveProgress.value = {
         ...(liveProgress.value || {}),
         phase: "done",
@@ -75,6 +102,11 @@ function attachWatch(id) {
         refreshCompare();
       });
     } else if (payload.type === "error") {
+      if (progressFlushTimer) {
+        clearTimeout(progressFlushTimer);
+        progressFlushTimer = null;
+      }
+      pendingProgress = null;
       error.value = payload.data?.message || "Run failed";
       activeRunId.value = null;
       liveProgress.value = {
@@ -200,6 +232,11 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (unwatch) unwatch();
   if (pollTimer) clearInterval(pollTimer);
+  if (progressFlushTimer) {
+    clearTimeout(progressFlushTimer);
+    progressFlushTimer = null;
+  }
+  pendingProgress = null;
 });
 </script>
 

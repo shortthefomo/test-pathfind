@@ -231,42 +231,111 @@ const props = defineProps({
 
 const canvas = ref(null);
 let chart = null;
+/** Labels the user toggled off via legend — survives chart rebuilds. */
+const hiddenLabels = new Set();
 
-function build() {
-  if (!canvas.value) return;
-  if (chart) chart.destroy();
+function datasetKey(ds, index) {
+  return ds?.label != null ? String(ds.label) : `__idx_${index}`;
+}
 
-  const many = props.datasets.length > 12;
-  const legendDisplay =
-    props.showLegend !== undefined
-      ? props.showLegend
-      : props.overlay
-        ? props.datasets.length > 1 && props.datasets.length <= 16
-        : props.datasets.length > 1;
+function syncHiddenFromChart() {
+  if (!chart) return;
+  chart.data.datasets.forEach((ds, i) => {
+    const key = datasetKey(ds, i);
+    if (chart.isDatasetVisible(i)) hiddenLabels.delete(key);
+    else hiddenLabels.add(key);
+  });
+}
 
+function legendDisplayFor(datasets) {
+  if (props.showLegend !== undefined) return props.showLegend;
+  if (props.overlay) return datasets.length > 1 && datasets.length <= 16;
+  return datasets.length > 1;
+}
+
+function observePluginConfig() {
   const hasObserve =
     props.observeWindow &&
     props.observeWindow.startMs != null &&
     props.observeWindow.endMs != null &&
     props.pointTMs?.length > 0;
+  if (!hasObserve) return null;
+  return {
+    startMs: props.observeWindow.startMs,
+    endMs: props.observeWindow.endMs,
+    pointTMs: props.pointTMs,
+    label: props.observeWindow.label || "Observe window",
+    fillStyle: "rgba(167, 139, 250, 0.14)",
+    borderColor: "rgba(167, 139, 250, 0.9)",
+    borderDash: [5, 4],
+    labelColor: "#c4b5fd",
+  };
+}
+
+function timeMarkersPluginConfig() {
+  if (!props.timeMarkers?.length || !props.pointTMs?.length) return null;
+  return {
+    pointTMs: props.pointTMs,
+    markers: props.timeMarkers,
+    color: "rgba(56, 189, 248, 0.7)",
+    labelColor: "#7dd3fc",
+    borderDash: [3, 3],
+  };
+}
+
+function mapDataset(ds, i) {
+  const key = datasetKey(ds, i);
+  return {
+    tension: 0.25,
+    borderWidth: props.overlay ? 1.2 : 2,
+    pointRadius: ds.pointRadius ?? (props.overlay ? 0 : 3),
+    pointHoverRadius: ds.pointHoverRadius ?? 4,
+    fill: ds.fill ?? false,
+    ...ds,
+    // Restore click-to-hide across live rebuilds
+    hidden: hiddenLabels.has(key) || Boolean(ds.hidden),
+  };
+}
+
+/** True when structure changed enough that destroy/create is safer than mutate. */
+function needsFullRebuild() {
+  if (!chart) return true;
+  if (chart.data.datasets.length !== props.datasets.length) return true;
+  // Overlay ↔ normal interaction modes differ; recreate if mode flips
+  const wasOverlay = Boolean(chart.$isOverlay);
+  if (wasOverlay !== Boolean(props.overlay)) return true;
+  // Session labels can reshuffle as new path_finds open — rebuild if keys drift
+  for (let i = 0; i < props.datasets.length; i++) {
+    const prev = chart.data.datasets[i]?.label;
+    const next = props.datasets[i]?.label;
+    if (String(prev ?? "") !== String(next ?? "")) return true;
+  }
+  return false;
+}
+
+function build() {
+  if (!canvas.value) return;
+  // Capture toggle state before destroy (in case it drifted)
+  syncHiddenFromChart();
+  if (chart) {
+    chart.destroy();
+    chart = null;
+  }
+
+  const legendDisplay = legendDisplayFor(props.datasets);
 
   chart = new Chart(canvas.value, {
     type: "line",
     data: {
       labels: props.labels,
-      datasets: props.datasets.map((ds) => ({
-        tension: 0.25,
-        borderWidth: props.overlay ? 1.2 : 2,
-        pointRadius: ds.pointRadius ?? (props.overlay ? 0 : 3),
-        pointHoverRadius: ds.pointHoverRadius ?? 4,
-        fill: ds.fill ?? false,
-        ...ds,
-      })),
+      datasets: props.datasets.map(mapDataset),
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      animation: props.overlay && many ? false : undefined,
+      // Live runs update often; animation stalls the main thread with many series
+      animation: false,
+      animations: false,
       interaction: {
         mode: props.overlay ? "nearest" : "index",
         intersect: false,
@@ -275,10 +344,36 @@ function build() {
       plugins: {
         legend: {
           display: legendDisplay,
+          onClick(_e, legendItem, legend) {
+            // Toggle series visibility; remember so live rebuilds keep it
+            const index = legendItem.datasetIndex;
+            const ci = legend.chart;
+            if (index == null || !ci) return;
+            const ds = ci.data.datasets[index];
+            const key = datasetKey(ds, index);
+            if (ci.isDatasetVisible(index)) {
+              ci.hide(index);
+              legendItem.hidden = true;
+              hiddenLabels.add(key);
+            } else {
+              ci.show(index);
+              legendItem.hidden = false;
+              hiddenLabels.delete(key);
+            }
+          },
+          onHover(e) {
+            const el = e?.native?.target;
+            if (el?.style) el.style.cursor = "pointer";
+          },
+          onLeave(e) {
+            const el = e?.native?.target;
+            if (el?.style) el.style.cursor = "default";
+          },
           labels: {
             color: "#94a3b8",
             boxWidth: 10,
             font: { size: 10 },
+            usePointStyle: false,
             filter: () => {
               if (!props.overlay) return true;
               return props.datasets.length <= 16;
@@ -313,28 +408,8 @@ function build() {
               }
             : undefined,
         },
-        observeWindow: hasObserve
-          ? {
-              startMs: props.observeWindow.startMs,
-              endMs: props.observeWindow.endMs,
-              pointTMs: props.pointTMs,
-              label: props.observeWindow.label || "Observe window",
-              fillStyle: "rgba(167, 139, 250, 0.14)",
-              borderColor: "rgba(167, 139, 250, 0.9)",
-              borderDash: [5, 4],
-              labelColor: "#c4b5fd",
-            }
-          : null,
-        timeMarkers:
-          props.timeMarkers?.length && props.pointTMs?.length
-            ? {
-                pointTMs: props.pointTMs,
-                markers: props.timeMarkers,
-                color: "rgba(56, 189, 248, 0.7)",
-                labelColor: "#7dd3fc",
-                borderDash: [3, 3],
-              }
-            : null,
+        observeWindow: observePluginConfig(),
+        timeMarkers: timeMarkersPluginConfig(),
       },
       scales: {
         x: {
@@ -365,9 +440,61 @@ function build() {
     },
   });
 
+  chart.$isOverlay = Boolean(props.overlay);
   if (props.overlay && chart.options.plugins.tooltip) {
     chart.options.plugins.tooltip.limit = 8;
   }
+}
+
+/**
+ * Mutate an existing Chart.js instance instead of destroy/create.
+ * Critical during live observe: 7 charts × full rebuild freezes the tab.
+ */
+function applyUpdate() {
+  if (!canvas.value) return;
+  if (needsFullRebuild()) {
+    build();
+    return;
+  }
+
+  chart.data.labels = props.labels;
+  for (let i = 0; i < props.datasets.length; i++) {
+    const ds = props.datasets[i];
+    const target = chart.data.datasets[i];
+    const key = datasetKey(ds, i);
+    target.data = ds.data;
+    target.label = ds.label;
+    if (ds.borderColor != null) target.borderColor = ds.borderColor;
+    if (ds.backgroundColor != null) target.backgroundColor = ds.backgroundColor;
+    if (ds.borderWidth != null) target.borderWidth = ds.borderWidth;
+    if (ds.pointRadius != null) target.pointRadius = ds.pointRadius;
+    if (ds.fill != null) target.fill = ds.fill;
+    if (ds.spanGaps != null) target.spanGaps = ds.spanGaps;
+    if (ds.stepped != null) target.stepped = ds.stepped;
+    target.hidden = hiddenLabels.has(key) || Boolean(ds.hidden);
+  }
+
+  if (chart.options.plugins) {
+    chart.options.plugins.observeWindow = observePluginConfig();
+    chart.options.plugins.timeMarkers = timeMarkersPluginConfig();
+  }
+  if (chart.options.plugins?.title) {
+    chart.options.plugins.title.display = Boolean(props.title);
+    chart.options.plugins.title.text = props.title;
+  }
+  if (chart.options.plugins?.legend) {
+    chart.options.plugins.legend.display = legendDisplayFor(props.datasets);
+  }
+  if (chart.options.scales?.x?.title) {
+    chart.options.scales.x.title.display = Boolean(props.xTitle);
+    chart.options.scales.x.title.text = props.xTitle;
+  }
+  if (chart.options.scales?.y?.title) {
+    chart.options.scales.y.title.display = Boolean(props.yTitle);
+    chart.options.scales.y.title.text = props.yTitle;
+  }
+
+  chart.update("none");
 }
 
 watch(
@@ -381,13 +508,16 @@ watch(
     props.observeWindow,
     props.timeMarkers,
   ],
-  () => build(),
+  () => applyUpdate(),
   { deep: true }
 );
 
 onMounted(build);
 onBeforeUnmount(() => {
-  if (chart) chart.destroy();
+  if (chart) {
+    chart.destroy();
+    chart = null;
+  }
 });
 </script>
 

@@ -1033,17 +1033,25 @@ export async function runLoadTest(cfg, wallets, opts = {}) {
   emitProgress = (phase, message = null, force = false) => {
     if (!onProgress) return;
     const now = Date.now();
-    // Throttle chatty phases; always allow phase transitions (force)
-    if (
-      !force &&
-      (phase === "burst" ||
-        phase === "ramp_up" ||
-        phase === "ramp" ||
-        phase === "ramp_down") &&
-      now - lastProgressAt < 250
-    )
-      return;
-    if (!force && phase === "ready" && now - lastProgressAt < 400) return;
+    // Throttle non-forced progress. Observe used to fire on every follow_up
+    // (100+ sessions ≈ 100+ SSE/s of ~200KB snapshots) and froze the browser.
+    // force=true still used for phase transitions / important messages.
+    if (!force) {
+      const minIntervalMs =
+        phase === "observe"
+          ? 750
+          : phase === "ready"
+            ? 400
+            : phase === "closing"
+              ? 500
+              : phase === "burst" ||
+                  phase === "ramp_up" ||
+                  phase === "ramp" ||
+                  phase === "ramp_down"
+                ? 250
+                : 500;
+      if (now - lastProgressAt < minIntervalMs) return;
+    }
     lastProgressAt = now;
     try {
       onProgress(
